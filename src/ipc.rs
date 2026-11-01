@@ -82,39 +82,3 @@ pub fn ensure_service() -> Result<()> {
     }
     bail!("G502 Hub service did not start; see service.log")
 }
-/// One-time test handover uses the Python service's public JSON protocol,
-/// without loading or invoking any Python code in the Rust application.
-pub fn stop_python() -> Result<()> {
-    // The test launcher explicitly hands over from the previous installation.
-    // Close its graphical client first so it cannot restart the old service.
-    for entry in std::fs::read_dir("/proc")?.flatten() {
-        if let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() {
-            if let Ok(bytes) = std::fs::read(entry.path().join("cmdline")) {
-                let args: Vec<_> = bytes.split(|&b| b == 0).collect();
-                if args
-                    .windows(2)
-                    .any(|a| a[0] == b"-m" && a[1] == b"g502hub.gui")
-                {
-                    unsafe {
-                        libc::kill(pid, libc::SIGTERM);
-                    }
-                }
-            }
-        }
-    }
-
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("/tmp/g502hub-{}", unsafe { libc::getuid() })));
-    let path = runtime.join("g502-hub/service.sock");
-    if let Ok(mut sock) = UnixStream::connect(path) {
-        sock.set_read_timeout(Some(Duration::from_secs(5)))?;
-        sock.write_all(b"{\"version\":1,\"command\":\"stop\",\"args\":{\"tuple\":[]},\"kwargs\":{\"dict\":[]}}\n")?;
-        let mut reply = String::new();
-        BufReader::new(sock)
-            .take(MAX as u64)
-            .read_line(&mut reply)?;
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    Ok(())
-}

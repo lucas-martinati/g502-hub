@@ -3910,9 +3910,6 @@ impl eframe::App for App {
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     let result = (|| -> anyhow::Result<()> {
-        if args.iter().any(|a| a == "--take-over") {
-            ipc::stop_python()?;
-        }
         ipc::ensure_service()?;
         if args.iter().any(|a| a == "--background") {
             return Ok(());

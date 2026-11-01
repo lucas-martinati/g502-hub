@@ -1,9 +1,2 @@
-__pycache__/
-*.pyc
-.pytest_cache/
-*.egg-info/
-build/
-g502hub/bridge_bin/
-backups/
-dist/
-.wrangler/
+/target/
+*.log

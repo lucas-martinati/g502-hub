@@ -1,216 +1,105 @@
-# G502 Hub
+# G502 Hub — independent native implementation
 
-**An unofficial G HUB alternative for the Logitech G502 HERO, on Linux.**
-[g502hub.ahmedxsaad.me](https://g502hub.ahmedxsaad.me)
+A native Rust daemon **and** native egui/eframe settings application for the wired
+Logitech G502 HERO (`046d:c08b`). Derived from
+[Ahmedxsaad/g502-hub](https://github.com/Ahmedxsaad/g502-hub), GPL-3.0-or-later.
+This fork is developed independently for personal use. It is not an upstream rewrite proposal.
+The Python implementation remains in Git history and the preserved Python branches.
 
-DPI levels and sniper, lighting with live screen, audio and game effects,
-button remapping with G-Shift, five onboard profiles, and rules that change
-everything when you start a game or a YouTube video. No Windows, no Wine,
-no root.
-
-![G502 Hub: live lighting following the screen](docs/screenshots/lighting-live.webp)
-
-## Install
+## Build and test
 
 ```sh
-curl -fsSL https://g502hub.ahmedxsaad.me/install.sh | sh
+cargo test --release
+cargo build --release
+# Optional per-user installation (no root): ./install.sh
+# Launch the native UI (stop the Python application first if it is running):
+./target/release/g502-hub
 ```
 
-It installs the dependencies with your package manager, puts the app in
-`~/.local/share/g502-hub`, adds the permission rule that lets your user talk
-to the mouse, and adds **G502 Hub** to your applications menu. Uninstall with
-`curl -fsSL https://g502hub.ahmedxsaad.me/install.sh | sh -s -- --uninstall`.
+The daemon is `g502-hubd`. Build it without GUI dependencies with
+`cargo build --release --no-default-features --bin g502-hubd`.
+Use `g502-hubd --status` or `--stop` for diagnostics and shutdown.
+The integrated header contains the window controls. Drag the header to move the
+window; double-click it to maximize/restore, or use F11 for fullscreen. Resizing
+works from the edges. Closing waits for a pending profile save.
 
-On Arch, EndeavourOS, Manjaro and CachyOS you can build a real pacman
-package instead, from the PKGBUILD in [`packaging/aur`](packaging/aur):
+Closing the graphical window leaves only the daemon. Reopen the test launcher
+to edit settings. Stop Rust before reopening the original Python application.
 
-```sh
-git clone https://github.com/Ahmedxsaad/g502-hub && cd g502-hub/packaging/aur
-makepkg -si
-```
+The first launch copies existing `g502-hub/settings.json` into a separate
+`g502-hub-rust/settings.json` under the XDG config directory. It does not update
+Python's configuration. Both applications configure the same physical onboard
+memory: profile edits saved to the mouse are therefore shared between them.
+The UI automatically saves profile edits after a short debounce and control release.
 
-It will be on the AUR (`yay -S g502-hub`) as soon as AUR account
-registration reopens.
+## Implemented
 
-Built and tested on EndeavourOS with KDE Plasma 6 (Wayland). Fedora and
-Debian/Ubuntu package names in the installer are best effort; reports welcome.
+- Direct HID++ transport over hidraw, feature discovery, identity and firmware.
+- Profile-format-2 codecs preserving unknown bytes, CRC verification, restricted
+  writes, whole-sector busy retry and read-back verification. Automatic complete
+  backup before the first write in each session.
+- DPI levels, defaults, DPI Shift, report intervals, primary and
+  G-Shift button layers, keyboard shortcuts and media bindings.
+- Both LED zones: off, static, cycle, breathing; separate live effects including
+  wave, DPI colors, audio spectrum/pulse/rainbow and screen sampling.
+- Profile names, switching, cycle inclusion, reset, copy, compatible .g502profile
+  import/export, complete backup and restore.
+- Macro editor and keyboard recording, delays, text, key/button press/release,
+  movement, scroll and media; once/held/toggle playback over Linux uinput.
+  AZERTY text via native libxkbcommon; optional onboard macro storage.
+- Steam process detection, X11/KWin active windows, MPRIS media rules, profile
+  switching/restoration, cover-art colors, CS2/Dota 2 GSI and LIGHTSYNC UDP input.
+- GSI config installation and Wine/Proton registry management with backups and
+  running-prefix checks. Existing upstream SDK bridge DLLs are wire-compatible.
+- Per-user Unix JSON IPC, single-instance service, independent GUI lifecycle,
+  optional login startup, and KDE DPI/profile OSD.
 
-Close Piper / ratbagd while using G502 Hub: ratbagd overwrites the mouse's
-G-Shift layer whenever it saves.
+## Native boundaries and dependencies
 
-## What it does
+No Python interpreter or Qt is used by the Rust daemon or GUI. The program links
+libxkbcommon for keyboard layout and uses Linux hidraw/uinput. Audio monitoring
+uses the system `parec` capture utility; screen capture uses system GStreamer
+(`gst-launch-1.0`, ximagesrc or PipeWire plus the desktop portal). This is system
+multimedia infrastructure rather than a Python fallback. The small KWin adapter
+remains JavaScript because that is KWin's scripting interface. SDK bridge DLLs
+are optional existing upstream Windows binaries, not part of this Rust rewrite.
 
-**Lightsync**
-- *On the mouse*: Fixed, Breathing, Color cycle or Off for the DPI lights and
-  the logo, together or separately. Saved in the mouse, so it works without
-  the app and on any computer.
-- *Live effects*, made by the app while it runs (it stays in the tray):
-  - **Screen sampler**: the mouse glows with the film, video or game on your
-    screen. Each zone follows the whole screen, the center or an edge.
-  - **Audio visualizer**: pulse, spectrum or rainbow beats, from whatever is playing.
-  - **Color wave** from the DPI lights to the logo.
-  - **DPI colors**: the lights show which DPI level you're on.
-- A color wheel with hex/RGB fields and your own saved colors.
+The native UI follows the original Qt layout, with matching mouse hit regions,
+LED previews, profile cards and editors. It is not verified pixel-for-pixel.
+GSI visual effects, cover-art palettes and audio analysis use the Python formulas,
+with numeric reference tests extracted from the original implementation. Wayland screen sharing still requires the desktop's permission;
+active-window rules on Wayland require KDE, as in the original implementation.
 
-**Sensitivity**: up to 5 DPI levels from 100 to 25,600 on a draggable track,
-default and sniper level, report rate up to 1000 Hz. While you drag the level
-you're on, the mouse's DPI follows so you can feel it. An on-screen popup
-shows the new DPI when you change it.
+## Experimental status
 
-**Assignments**: all 11 buttons, on the primary layer and the G-Shift layer:
-mouse buttons, scrolling, DPI and profile controls, any key combination
-(labelled for your keyboard layout), media keys.
+Protocol/codec tests use the upstream public real-device dump. Destructive
+writes, errors and retries are exercised against a simulated HID transport.
+Native macro cancellation tests use an isolated virtual event sink. An opt-in
+`cargo test --locked --release --test text_device -- --ignored --nocapture` check
+reads its own grabbed uinput device; it requires local input permissions. The complete feature set still needs
+hands-on validation on real games, portals and Wine prefixes; compilation and
+unit tests alone do not establish complete behavioral equivalence.
 
-**Macros**: record them by typing or build them step by step (keys, text,
-waits, clicks, scrolling, media keys). Saved on the mouse they play on any
-computer; run by the app they can also type text in your layout, repeat while
-you hold the button, or toggle on and off.
+Configuration and backups are separate, but onboard saves affect the physical
+mouse. A previous Python installation remains usable after stopping the Rust
+service. The login option controls the normal G502 Hub autostart entry. Installation
+preserves an existing enabled startup entry and updates it to the installed
+service. Previous desktop launchers are backed up in the data directory.
 
-**Profiles**: the 5 onboard slots: rename, activate, include in the G9 cycle,
-reset to factory, copy, **export to a file and import** (share your setup),
-plus full backups and restore.
+File selection uses the optional system `zenity` utility, with a path-entry
+fallback. Linux development packages include libxkbcommon, X11 and Wayland.
 
-**Games & apps**: rules like
+The Logitech photo is not included in this repository. The UI reads its existing
+XDG cache, downloads it on first use when absent, and offers a new-download button
+in Settings. Downloading uses the optional system `curl` utility; see NOTICE.md.
 
-| When | Then |
-|---|---|
-| YouTube is playing | red |
-| an anime with "One Piece" in the title is playing | orange breathing, profile slot 3 |
-| any Steam game is running | colors from the game's cover art, profile slot 1 |
-| Counter-Strike 2 is running | game-driven: health, bomb, flashbangs |
+The executables and application menu use `g502-hub` and `g502-hubd`.
+The legacy `g502-hub-rust` data/config/runtime directories are retained for
+compatibility with existing native installations and to avoid overwriting
+the earlier Python configuration.
 
-Triggers: a game is running (Steam and Proton games are found automatically),
-an app is in front, a window title contains something, or the media that's
-playing contains something (browsers, mpv, VLC, Spotify, anime apps…).
+## Parity audit
 
-**Game-driven lighting** (new in 0.2; reports from real matches welcome)
-- **CS2 and Dota 2** through Valve's official Game State Integration (one
-  click in Settings): health, team colors, bomb timer, flashbangs, kills, mana.
-- **LIGHTSYNC bridge for Proton games**: Windows games with built-in Logitech
-  lighting talk to a small `LogitechLed.dll` that G502 Hub adds to that game's
-  Proton prefix, so they light the mouse like they do with G HUB on Windows.
-  Experimental; turn it on per game in Settings.
+The functional gaps listed in the initial audit have been ported, including DPI track insertion, factory assignments, macro labels/storage validation, rule templates/recent context, photo/access/GSI settings and the About page. See [the parity audit](PARITY.md) for test evidence and remaining platform/rendering limitations.
 
-## Screenshots
-
-| | |
-|---|---|
-| ![Games & apps rules](docs/screenshots/games.webp) | ![Lighting saved on the mouse](docs/screenshots/lighting.webp) |
-| ![Sensitivity](docs/screenshots/sensitivity.webp) | ![Assignments](docs/screenshots/assignments.webp) |
-
-The mouse in the app is Logitech's product photo, which the app downloads from
-logitechg.com the first time it starts ([NOTICE.md](NOTICE.md)).
-
-## Safety
-
-G502 Hub talks to the mouse directly over HID++ 2.0 (`/dev/hidraw`), the same
-protocol G HUB uses.
-
-- Before its first change each session it saves a full backup of the mouse's
-  memory to `~/.local/share/g502-hub/backups/`; any backup can be restored
-  from the Profiles page.
-- It writes only the user profile area, never the factory profiles, and reads
-  every write back to check it.
-- Bytes it doesn't understand are kept as they are; byte-exact round trips of
-  real memory dumps are part of the tests.
-- It never uses the hidden factory/engineering features of the firmware.
-- Live effects only change the lights' RAM: quitting brings the saved
-  lighting straight back.
-
-## FAQ
-
-**Does it support other G502 models?** Only the wired G502 HERO (USB
-`046d:c08b`) so far. Other models need someone with one to help test; open
-an issue with your "Copy for a bug report" info from the About page.
-
-**Wayland?** Yes, that's what it's built on. Screen capture goes through the
-desktop's screen-sharing portal (KDE asks once which screen to share), the
-active window comes from a tiny KWin script, popups use Plasma's OSD. On
-other desktops everything except active-window rules works.
-
-**The mouse photo?** The picture of the mouse in the app is Logitech's
-product photo. It isn't part of this project: the app downloads it once from
-logitechg.com the first time it starts. See [NOTICE.md](NOTICE.md).
-
-**Does anything leave my computer?** No. Screen and audio are analysed
-locally, and nothing is sent anywhere. The only download is the mouse photo,
-once, from Logitech's website.
-
-## Command line
-
-```sh
-g502hub info            # device, firmware, live DPI/rate, LED zones
-g502hub profiles        # all 5 onboard slots at a glance
-g502hub show 2          # one slot: DPI, buttons + G-Shift layer, lighting
-g502hub backup          # full onboard memory dump
-g502hub restore FILE --yes
-
-g502hub activate 3
-g502hub set 2 --dpi 400,800,1600,3200 --default 3 --shift 1 --rate 1000 --name "Desktop"
-g502hub bind 2 g7 key:ctrl+c
-g502hub bind 2 g8 media:volume-up --gshift
-g502hub led 2 all breathing 00dcff --period 4000 --brightness 80
-g502hub disable 5       # skip slot 5 when cycling profiles with G9
-g502hub spy             # print raw button presses (Mouse Button Spy)
-```
-
-From a source checkout use `python3 -m g502hub` instead of `g502hub`.
-
-## Development
-
-```sh
-git clone https://github.com/Ahmedxsaad/g502-hub && cd g502-hub
-sudo install -m644 udev/70-g502-hub.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger --action=change --subsystem-match=hidraw
-sudo udevadm trigger --action=change --sysname-match=uinput
-python3 -m g502hub.gui                     # the app
-QT_QPA_PLATFORM=offscreen python3 -m pytest
-sh bridge/logitechled/build.sh             # LogitechLed.dll (needs clang, llvm, lld)
-QT_QPA_PLATFORM=offscreen tools/screenshots.py   # README / website screenshots
-tools/deploy-site.sh                       # publish the website (Cloudflare)
-```
-
-```
-g502hub/hidpp.py       HID++ 2.0 transport over hidraw
-g502hub/device.py      G502 features: 0x8100 onboard, 0x2201 DPI, 0x8060 rate, 0x8070 LEDs, 0x8110 spy
-g502hub/onboard.py     profile/directory/binding/LED codecs (format 2)
-g502hub/macro.py       onboard macro codec (format 1)
-g502hub/backup.py      dump/restore
-g502hub/sharing.py     profile files (.g502profile)
-g502hub/rules.py       Games & apps rules
-g502hub/context.py     what's happening: active window (KWin), media (MPRIS), Steam games
-g502hub/lightfx.py     color maths for the live effects
-g502hub/effects/       screen (portal + PipeWire), audio (parec), CS2/Dota 2 GSI, LIGHTSYNC receiver
-g502hub/lightsync_bridge.py  installs the bridge into Proton prefixes
-g502hub/gui/           the app (PySide6)
-bridge/logitechled/    the LogitechLed.dll stand-in (freestanding C)
-docs/protocol.md       wire protocol reference with sources
-docs/hardware-notes.md behaviour verified on the real mouse
-```
-
-## Credits
-
-Made by **Ahmed Saad**: [ahmedxsaad.me](https://ahmedxsaad.me) ·
-[GitHub](https://github.com/Ahmedxsaad) · [LinkedIn](https://www.linkedin.com/in/ahmedsaad0/)
-
-Built on the public work of [libratbag](https://github.com/libratbag/libratbag),
-[Solaar](https://github.com/pwr-Solaar/Solaar),
-[cvuchener/hidpp](https://github.com/cvuchener/hidpp),
-[OpenRGB](https://gitlab.com/CalcProgrammer1/OpenRGB) and the Linux kernel's
-`hid-logitech-hidpp` driver, whose notes on Logitech's HID++ protocol helped
-map the mouse (see [docs/protocol.md](docs/protocol.md)).
-
-## License
-
-[GNU GPL v3 or later](LICENSE). See [NOTICE.md](NOTICE.md) for trademarks,
-the mouse photo, third-party components and privacy.
-
-An unofficial, independent project. Not affiliated with, endorsed or supported
-by Logitech. Logitech, Logitech G, G HUB, LIGHTSYNC, HERO and G502 are
-trademarks of Logitech Europe S.A.
-
-## Experimental native Rust port
-
-An optional native settings interface and headless service are available under
-[`rust/`](rust/README.md). The port is experimental; see its README for build
-instructions, dependencies, hardware-testing limits and coexistence with Python.
+The launcher and login-startup entry use `io.github.lucas_martinati.G502Hub.desktop` to avoid replacing upstream Python entries. Installation does not stop or take over another application. Enable login startup in Settings.

@@ -98,7 +98,7 @@ pub fn autostart_path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home().join(".config"))
-        .join("autostart/g502-hub.desktop")
+        .join("autostart/io.github.lucas_martinati.G502Hub.desktop")
 }
 pub fn autostart(on: bool) -> Result<()> {
     let p = autostart_path();
@@ -108,7 +108,7 @@ pub fn autostart(on: bool) -> Result<()> {
         fs::write(
             p,
             format!(
-                "[Desktop Entry]\nType=Application\nName=G502 Hub\nExec=\"{}\" --background --take-over\nIcon=input-mouse\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+                "[Desktop Entry]\nType=Application\nName=G502 Hub\nExec=\"{}\" --background\nIcon=input-mouse\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
                 exe.display()
                     .to_string()
                     .replace('\\', "\\\\")
