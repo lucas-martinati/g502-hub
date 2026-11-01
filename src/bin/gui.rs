@@ -1,3 +1,5 @@
+#[path = "gui/macro_editor.rs"]
+mod macro_editor;
 #[path = "gui/mouse.rs"]
 mod mouse;
 #[path = "gui/window.rs"]
@@ -672,10 +674,6 @@ struct App {
     profile_file_dialog: bool,
     file_operation: String,
     picked_file: Arc<Mutex<Option<(String, usize, Option<String>)>>>,
-    step_selected: usize,
-    step_tab: usize,
-    step_text: String,
-    step_wait: u64,
     snap: Snapshot,
     settings: Value,
     tx: mpsc::Sender<(String, Value)>,
@@ -920,10 +918,6 @@ impl App {
             profile_file_dialog: false,
             file_operation: "import_profile".into(),
             picked_file: Arc::new(Mutex::new(None)),
-            step_selected: 0,
-            step_tab: 0,
-            step_text: String::new(),
-            step_wait: 100,
             snap: Snapshot::default(),
             settings: json!({}),
             tx,
@@ -2907,240 +2901,64 @@ impl App {
             }
         }
     }
-    fn macros(&mut self, ui: &mut egui::Ui) {
-        section(ui, "Name");
+    fn macro_properties(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("MACRO NAME").small().color(MUTED));
         string(ui, &mut self.macro_draft["name"]);
-        section(ui, "Runs");
-        choices(
-            ui,
-            "target",
-            &mut self.macro_draft["target"],
-            &[("mouse", "Saved on the mouse"), ("app", "Run by G502 Hub")],
-            2,
-        );
-        let on_mouse = self.macro_draft["target"] == "mouse";
-        if on_mouse {
-            self.macro_draft["mode"] = json!("once");
-        }
-        section(ui, "Plays");
-        for (mode, label) in [
-            ("once", "Once per press"),
-            ("while-held", "Repeats while held"),
-            ("toggle", "Press to start, again to stop"),
-        ] {
-            ui.add_enabled_ui(!on_mouse || mode == "once", |ui| {
-                if choice(
+        ui.add_space(12.);
+        ui.horizontal_wrapped(|ui| {
+            macro_editor::select(
+                ui,
+                "execution",
+                &mut self.macro_draft["target"],
+                &[("app", "Run by G502 Hub"), ("mouse", "Saved on the mouse")],
+            );
+            let on_mouse = self.macro_draft["target"] == "mouse";
+            if on_mouse {
+                self.macro_draft["mode"] = json!("once");
+            }
+            ui.add_enabled_ui(!on_mouse, |ui| {
+                macro_editor::select(
                     ui,
-                    label,
-                    self.macro_draft["mode"] == mode,
-                    ui.available_width(),
-                )
-                .clicked()
-                {
-                    self.macro_draft["mode"] = json!(mode);
-                }
+                    "repeat",
+                    &mut self.macro_draft["mode"],
+                    &[
+                        ("once", "Once per press"),
+                        ("while-held", "Repeat while held"),
+                        ("toggle", "Toggle repeat"),
+                    ],
+                );
             });
-        }
-        section(ui, "Steps");
-        let steps = self.macro_draft["steps"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        egui::Frame::new()
-            .fill(RAISED)
-            .corner_radius(4)
-            .inner_margin(8)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("macro_steps")
-                    .max_height(170.)
-                    .min_scrolled_height(160.)
-                    .show(ui, |ui| {
-                        ui.set_min_width(ui.available_width());
-                        for (i, step) in steps.iter().enumerate() {
-                            let args = &step["args"];
-                            let label = match step["kind"].as_str().unwrap_or("") {
-                                "key" | "key-down" | "key-up" => format!(
-                                    "{}  {}",
-                                    step["kind"].as_str().unwrap(),
-                                    args["combo"].as_str().unwrap_or("")
-                                ),
-                                "text" => format!("Type: {}", args["text"].as_str().unwrap_or("")),
-                                "delay" => format!("Wait {} ms", args["ms"]),
-                                "click" | "button-down" | "button-up" => format!(
-                                    "{} {}",
-                                    step["kind"].as_str().unwrap(),
-                                    args["button"].as_str().unwrap_or("")
-                                ),
-                                "media" => format!("Media: {}", args["key"].as_str().unwrap_or("")),
-                                _ => format!("{} {}", step["kind"].as_str().unwrap_or(""), args),
-                            };
-                            if ui
-                                .selectable_label(self.step_selected == i, label)
-                                .clicked()
-                            {
-                                self.step_selected = i;
-                            }
-                        }
-                    });
-            });
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    self.step_selected > 0 && self.step_selected < steps.len(),
-                    egui::Button::new("Up"),
-                )
-                .clicked()
-            {
-                self.macro_draft["steps"]
-                    .as_array_mut()
-                    .unwrap()
-                    .swap(self.step_selected, self.step_selected - 1);
-                self.step_selected -= 1;
-            }
-            if ui
-                .add_enabled(
-                    self.step_selected + 1 < steps.len(),
-                    egui::Button::new("Down"),
-                )
-                .clicked()
-            {
-                self.macro_draft["steps"]
-                    .as_array_mut()
-                    .unwrap()
-                    .swap(self.step_selected, self.step_selected + 1);
-                self.step_selected += 1;
-            }
-            if ui
-                .add_enabled(
-                    self.step_selected < steps.len(),
-                    egui::Button::new("Remove"),
-                )
-                .clicked()
-            {
-                self.macro_draft["steps"]
-                    .as_array_mut()
-                    .unwrap()
-                    .remove(self.step_selected);
-                self.step_selected = self.step_selected.saturating_sub(1);
-            }
         });
+        if ui
+            .button(if self.recording {
+                "Stop recording (Esc)"
+            } else {
+                "Record keyboard actions"
+            })
+            .clicked()
+        {
+            self.recording = !self.recording;
+            self.record_at = None;
+            self.record_keys.clear();
+        }
+    }
+    fn macros(&mut self, ui: &mut egui::Ui) {
+        let on_mouse = self.macro_draft["target"] == "mouse";
+        section(ui, "Sequence");
+        macro_editor::sequence(ui, &mut self.macro_draft);
         let validation = parity::macro_size(&self.macro_draft, &self.typing);
         ui.label(RichText::new(match &validation {
             Ok(Some(n))=>format!("Uses {n} of 253 bytes of mouse memory."),
             Ok(None)=>"Runs from the app, so there's no size limit. Its button does nothing while G502 Hub isn't running.".into(),
             Err(e)=>if on_mouse{format!("Can't be saved on the mouse: {e}. Choose “Run by G502 Hub” instead.")}else{e.to_string()},
         }).size(12.).color(MUTED));
-        section(ui, "Add a step");
-        segments(
-            ui,
-            &mut self.step_tab,
-            &["Key", "Text", "Wait", "Mouse", "Media"],
-        );
-        let mut add = None;
-        match self.step_tab {
-            0 => {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.step_text)
-                        .hint_text("Key or shortcut, e.g. ctrl+c")
-                        .desired_width(f32::INFINITY),
-                );
-                if ui.button("Add key").clicked() {
-                    match input::combo(&self.step_text) {
-                        Ok(_) => add = Some(json!({"kind":"key","args":{"combo":self.step_text}})),
-                        Err(e) => {
-                            self.failed = true;
-                            self.message = e.to_string();
-                        }
-                    }
-                }
-                if ui
-                    .button(if self.recording {
-                        "Stop recording (Esc)"
-                    } else {
-                        "Record keys"
-                    })
-                    .clicked()
-                {
-                    self.recording = !self.recording;
-                    self.record_at = None;
-                    self.record_keys.clear();
-                }
-                ui.label(
-                    RichText::new("Recording keeps the waits between your key presses.")
-                        .size(12.)
-                        .color(MUTED),
-                );
-            }
-            1 => {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.step_text)
-                        .hint_text("Text to type, e.g. gg wp")
-                        .desired_width(f32::INFINITY),
-                );
-                if ui
-                    .add_enabled(!self.step_text.is_empty(), egui::Button::new("Add text"))
-                    .clicked()
-                {
-                    add = Some(json!({"kind":"text","args":{"text":self.step_text}}));
-                }
-            }
-            2 => {
-                ui.add(
-                    egui::DragValue::new(&mut self.step_wait)
-                        .range(1..=600000)
-                        .suffix(" ms"),
-                );
-                if ui.button("Add wait").clicked() {
-                    add = Some(json!({"kind":"delay","args":{"ms":self.step_wait}}));
-                }
-            }
-            3 => {
-                let w = (ui.available_width() - 6.) / 2.;
-                egui::Grid::new("macro_mouse")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        for (i, (key, label)) in [
-                            ("left", "Left click"),
-                            ("right", "Right click"),
-                            ("middle", "Middle click"),
-                            ("back", "Back"),
-                            ("forward", "Forward"),
-                        ]
-                        .iter()
-                        .enumerate()
-                        {
-                            if choice(ui, label, false, w).clicked() {
-                                add = Some(json!({"kind":"click","args":{"button":key}}));
-                            }
-                            if i % 2 == 1 {
-                                ui.end_row();
-                            }
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    for (label, amount) in [("Scroll up", 1), ("Scroll down", -1)] {
-                        if ui.button(label).clicked() {
-                            add = Some(json!({"kind":"scroll","args":{"amount":amount}}));
-                        }
-                    }
-                });
-            }
-            _ => {
-                for (key, label) in parity::MEDIA {
-                    if choice(ui, label, false, ui.available_width()).clicked() {
-                        add = Some(json!({"kind":"media","args":{"key":key}}));
-                    }
-                }
-            }
-        }
-        if let Some(step) = add {
-            self.macro_draft["steps"].as_array_mut().unwrap().push(step);
-        }
         ui.add_space(12.);
         ui.horizontal(|ui| {
             if ui
-                .add(egui::Button::new(RichText::new("Save macro").color(BG)).fill(ACCENT))
+                .add_enabled(
+                    validation.is_ok() && !self.recording,
+                    egui::Button::new(RichText::new("Apply macro").color(BG)).fill(ACCENT),
+                )
                 .clicked()
             {
                 if let Err(e) = parity::macro_size(&self.macro_draft, &self.typing) {
@@ -3721,7 +3539,8 @@ impl eframe::App for App {
                     }
                 });
             });
-        let wide = matches!(self.tab.as_str(), "profiles" | "about");
+        let wide = matches!(self.tab.as_str(), "profiles" | "about")
+            || (self.tab == "macros" && self.editing_library);
         egui::SidePanel::left("settings_panel").exact_width(410.).resizable(false).frame(egui::Frame::new().fill(PANEL).stroke(egui::Stroke::new(1.0f32,BORDER)).inner_margin(egui::Margin::symmetric(22,22))).show(ctx,|ui| {
             if self.tab!="profiles" {ui.heading(match self.tab.as_str(){"light"=>"Lighting","sens"=>"Sensitivity","buttons"=>"Assignments","profiles"=>"Onboard profiles","macros"=>if self.editing_library{"Macro"}else{"Macros"},"rules"=>if self.editing_library{"Rule"}else{"Games & apps"},"about"=>"About",_=>"Settings"});ui.add_space(12.);}
 
@@ -3729,7 +3548,7 @@ impl eframe::App for App {
             if self.write_failed {ui.colored_label(Color32::LIGHT_RED,&self.message);ui.horizontal(|ui|{if ui.button("Retry").clicked(){self.write_failed=false;self.apply();}if ui.button("Discard").clicked(){self.dirty=false;self.write_failed=false;self.load_draft();}});}
             egui::ScrollArea::vertical().id_salt(("side",&self.tab)).auto_shrink([false,false]).show(ui,|ui| {
                 if !self.snap.connected && !matches!(self.tab.as_str(),"about"|"settings") {ui.label("Waiting for the G502 HERO…");}
-                else {match self.tab.as_str(){"sens"=>self.sensitivity(ui),"buttons"=>self.buttons(ui),"light"=>self.lighting(ui),"settings"=>self.settings_page(ui),"profiles"=>{section(ui,"Device");ui.label("G502 HERO");ui.label(format!("Firmware {}",self.snap.firmware.join(" / ")));section(ui,"Backups");if !self.failed && self.message!="Ready" && !self.message.starts_with("Connexion") {ui.label(RichText::new(&self.message).size(12.).color(MUTED));}ui.label(RichText::new("A full backup is taken automatically before the first change each session.").color(MUTED));if ui.add_sized([ui.available_width(),34.],egui::Button::new("Back up now")).clicked(){self.send("backup",json!({}));}ui.add_space(10.);if ui.add_sized([ui.available_width(),34.],egui::Button::new("Restore a backup…")).clicked(){self.choose_profile_file("restore",self.slot,ui.ctx());}if ui.add_sized([ui.available_width(),34.],egui::Button::new("Open backups folder")).clicked(){let _=std::process::Command::new("xdg-open").arg(config::data_dir().join("backups")).spawn();}},"macros"|"rules"=>{if self.editing_library {if ui.button("<  Back").clicked(){self.editing_library=false;self.recording=false;}if self.tab=="macros" {self.macros(ui);}else{self.rules(ui);}}else{self.library_panel(ui);}},"about"=>self.about_info(ui),_=>{}}}
+                else {match self.tab.as_str(){"sens"=>self.sensitivity(ui),"buttons"=>self.buttons(ui),"light"=>self.lighting(ui),"settings"=>self.settings_page(ui),"profiles"=>{section(ui,"Device");ui.label("G502 HERO");ui.label(format!("Firmware {}",self.snap.firmware.join(" / ")));section(ui,"Backups");if !self.failed && self.message!="Ready" && !self.message.starts_with("Connexion") {ui.label(RichText::new(&self.message).size(12.).color(MUTED));}ui.label(RichText::new("A full backup is taken automatically before the first change each session.").color(MUTED));if ui.add_sized([ui.available_width(),34.],egui::Button::new("Back up now")).clicked(){self.send("backup",json!({}));}ui.add_space(10.);if ui.add_sized([ui.available_width(),34.],egui::Button::new("Restore a backup…")).clicked(){self.choose_profile_file("restore",self.slot,ui.ctx());}if ui.add_sized([ui.available_width(),34.],egui::Button::new("Open backups folder")).clicked(){let _=std::process::Command::new("xdg-open").arg(config::data_dir().join("backups")).spawn();}},"macros"|"rules"=>{if self.editing_library {if ui.button("<  Back").clicked(){self.editing_library=false;self.recording=false;}if self.tab=="macros" {self.macro_properties(ui);ui.add_space(24.);ui.label(RichText::new("Changes are kept in a draft. Apply when your sequence is ready, or cancel to discard it.").color(MUTED));}else{self.rules(ui);}}else{self.library_panel(ui);}},"about"=>self.about_info(ui),_=>{}}}
             });
         });
         egui::CentralPanel::default()
