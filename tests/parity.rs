@@ -119,8 +119,8 @@ fn lighting_and_audio_match_python_numeric_reference() {
             1.3,
             &mut 0.,
         );
-        for i in 0..2 {
-            close(colors[i], rgb(&v["expected"][i]));
+        for (i, &col) in colors.iter().enumerate() {
+            close(col, rgb(&v["expected"][i]));
         }
     }
     for v in f["analyzer"].as_array().unwrap() {
@@ -159,9 +159,9 @@ fn screen_regions_and_cover_palette_match_python() {
             v["area"].as_str().unwrap(),
             v["vivid"].as_bool().unwrap(),
         );
-        for i in 0..3 {
+        for (i, &ch) in color.iter().enumerate() {
             assert!(
-                (color[i] - v["expected"][i].as_f64().unwrap() as f32).abs() < 0.0001,
+                (ch - v["expected"][i].as_f64().unwrap() as f32).abs() < 0.0001,
                 "{} vivid {}",
                 v["area"],
                 v["vivid"]
@@ -175,12 +175,9 @@ fn screen_regions_and_cover_palette_match_python() {
         .map(|p| std::array::from_fn(|i| p[i].as_u64().unwrap() as u8))
         .collect();
     let palette = effects::palette(&pixels);
-    for z in 0..2 {
-        for i in 0..3 {
-            assert!(
-                (palette[z][i] - f["palette"]["expected"][z][i].as_f64().unwrap() as f32).abs()
-                    < 0.0001
-            );
+    for (z, zone_col) in palette.iter().enumerate() {
+        for (i, &ch) in zone_col.iter().enumerate() {
+            assert!((ch - f["palette"]["expected"][z][i].as_f64().unwrap() as f32).abs() < 0.0001);
         }
     }
 }
@@ -197,14 +194,13 @@ fn game_events_match_python_sequences() {
         let colors = fx
             .colors(game, &frame["data"], frame["t"].as_f64().unwrap() as f32)
             .unwrap();
-        for z in 0..2 {
-            for i in 0..3 {
+        for (z, zone_col) in colors.iter().enumerate() {
+            for (i, &ch) in zone_col.iter().enumerate() {
                 let expected = frame["expected"][z][i].as_f64().unwrap() as f32;
                 assert!(
-                    (colors[z][i] - expected).abs() < 0.0002,
-                    "{game} t={} zone {z} channel {i}: {} != {expected}",
+                    (ch - expected).abs() < 0.0002,
+                    "{game} t={} zone {z} channel {i}: {ch} != {expected}",
                     frame["t"],
-                    colors[z][i]
                 );
             }
         }

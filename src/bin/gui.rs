@@ -2512,12 +2512,11 @@ impl App {
                     if self.last_led_preview.elapsed() > Duration::from_millis(50)
                         || ui.input(|i| i.pointer.any_released())
                     {
-                        for zone in 0..2 {
+                        for (zone, led) in p.leds.iter().enumerate().take(2) {
                             if zone == self.light_zone || self.same_zones {
-                                let _ = self.tx.send((
-                                    "preview_led".into(),
-                                    json!({"zone":zone,"led":p.leds[zone]}),
-                                ));
+                                let _ = self
+                                    .tx
+                                    .send(("preview_led".into(), json!({"zone":zone,"led":led})));
                             }
                         }
                         self.last_led_preview = Instant::now();
