@@ -250,30 +250,89 @@ unsafe extern "C" {
         size: usize,
     ) -> libc::c_int;
 }
+pub fn parse_localectl_layout(text: &str) -> Option<String> {
+    let mut layout = None;
+    let mut variant = None;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(s) = trimmed.strip_prefix("X11 Layout:") {
+            let first = s.trim().split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                layout = Some(first.to_owned());
+            }
+        } else if let Some(s) = trimmed.strip_prefix("X11 Variant:") {
+            let first = s.trim().split(',').next().unwrap_or("").trim();
+            if !first.is_empty() {
+                variant = Some(first.to_owned());
+            }
+        }
+    }
+    layout.map(|l| match variant {
+        Some(v) => format!("{l}+{v}"),
+        None => l,
+    })
+}
+fn kde_layout() -> Option<String> {
+    let bus = zbus::blocking::connection::Builder::session()
+        .ok()?
+        .method_timeout(Duration::from_millis(500))
+        .build()
+        .ok()?;
+    let proxy = zbus::blocking::Proxy::new(
+        &bus,
+        "org.kde.keyboard",
+        "/Layouts",
+        "org.kde.KeyboardLayouts",
+    )
+    .ok()?;
+    let layouts: Vec<(String, String, String)> = proxy.call("getLayoutsList", &()).ok()?;
+    if layouts.is_empty() {
+        return None;
+    }
+    let idx: u32 = proxy.call("getLayout", &()).unwrap_or(0);
+    let (layout, variant, _) = layouts.get(idx as usize).or_else(|| layouts.first())?;
+    if layout.is_empty() {
+        return None;
+    }
+    Some(if variant.is_empty() {
+        layout.clone()
+    } else {
+        format!("{layout}+{variant}")
+    })
+}
 pub fn layout() -> String {
     if let Ok(s) = std::env::var("G502_RUST_LAYOUT") {
         return s;
+    }
+    if std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains("kde")
+        && let Some(kde) = kde_layout()
+    {
+        return kde;
     }
     if let Ok(o) = std::process::Command::new("gsettings")
         .args(["get", "org.gnome.desktop.input-sources", "sources"])
         .output()
     {
         let s = String::from_utf8_lossy(&o.stdout);
-        if let Some((_, tail)) = s.split_once("'xkb', '") {
-            if let Some((name, _)) = tail.split_once('\'') {
-                return name.into();
-            }
+        if let Some((_, tail)) = s.split_once("'xkb', '")
+            && let Some((name, _)) = tail.split_once('\'')
+            && !name.is_empty()
+        {
+            return name.into();
         }
+    }
+    if let Some(kde) = kde_layout() {
+        return kde;
     }
     if let Ok(o) = std::process::Command::new("localectl")
         .arg("status")
         .output()
+        && let Some(parsed) = parse_localectl_layout(&String::from_utf8_lossy(&o.stdout))
     {
-        for line in String::from_utf8_lossy(&o.stdout).lines() {
-            if let Some(s) = line.trim().strip_prefix("X11 Layout:") {
-                return s.trim().split(',').next().unwrap_or("us").into();
-            }
-        }
+        return parsed;
     }
     "us".into()
 }
@@ -327,10 +386,10 @@ pub fn typing_table(layout: &str) -> Result<HashMap<char, (u8, u16)>> {
                     let bytes = std::slice::from_raw_parts(buf.as_ptr() as *const u8, n as usize);
                     if let Ok(s) = std::str::from_utf8(bytes) {
                         let mut chars = s.chars();
-                        if let Some(c) = chars.next() {
-                            if chars.next().is_none() {
-                                table.entry(c).or_insert((m, code));
-                            }
+                        if let Some(c) = chars.next()
+                            && chars.next().is_none()
+                        {
+                            table.entry(c).or_insert((m, code));
                         }
                     }
                 }
@@ -649,11 +708,11 @@ impl Player {
                                 if down {
                                     *held.entry(code).or_default() += 1;
                                     backend.lock().unwrap().key(code, true)?;
-                                } else if let Some(n) = held.get_mut(&code) {
-                                    if *n > 0 {
-                                        *n -= 1;
-                                        backend.lock().unwrap().key(code, false)?;
-                                    }
+                                } else if let Some(n) = held.get_mut(&code)
+                                    && *n > 0
+                                {
+                                    *n -= 1;
+                                    backend.lock().unwrap().key(code, false)?;
                                 }
                                 wait(&c, 4);
                             }
@@ -694,10 +753,10 @@ impl Player {
         Ok(())
     }
     pub fn release(&mut self, key: &str) {
-        if let Some(r) = self.runs.get(key) {
-            if r.mode == "while-held" {
-                r.cancel.store(true, Ordering::Relaxed);
-            }
+        if let Some(r) = self.runs.get(key)
+            && r.mode == "while-held"
+        {
+            r.cancel.store(true, Ordering::Relaxed);
         }
     }
     pub fn reap(&mut self) {
@@ -931,5 +990,23 @@ mod variant_tests {
     #[test]
     fn gnome_layout_variant_is_supported() {
         assert!(super::typing_table("fr+latin9").unwrap().contains_key(&'é'));
+    }
+    #[test]
+    fn localectl_layout_and_variant_are_parsed() {
+        assert_eq!(
+            super::parse_localectl_layout(
+                "   System Locale: LANG=fr_FR.UTF-8\n      X11 Layout: fr\n     X11 Variant: latin9\n"
+            ),
+            Some("fr+latin9".into())
+        );
+        assert_eq!(
+            super::parse_localectl_layout("X11 Layout: fr,us\nX11 Variant: oss,\n"),
+            Some("fr+oss".into())
+        );
+        assert_eq!(
+            super::parse_localectl_layout("X11 Layout: us,de\nX11 Variant: ,nodeadkeys\n"),
+            Some("us".into())
+        );
+        assert_eq!(super::parse_localectl_layout("System Locale: C\n"), None);
     }
 }

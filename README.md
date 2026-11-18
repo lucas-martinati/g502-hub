@@ -6,7 +6,17 @@ Logitech G502 HERO (`046d:c08b`). Derived from
 This fork is developed independently for personal use. It is not an upstream rewrite proposal.
 The Python implementation remains in Git history and the preserved Python branches.
 
-## Build and test
+## Install & updates
+
+Install the latest precompiled release (no root or Rust toolchain required):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/lucas-martinati/g502-hub/rust-main/install.sh | sh
+```
+
+Installed copies check GitHub Releases automatically in the background (with SHA-256 verification and live service handoff, configurable under **Settings → Updates**). You can also check or update manually from the UI or terminal (`g502-hub --check-update`, `g502-hub --update`).
+
+## Build and test from source
 
 ```sh
 cargo test --release
@@ -52,7 +62,7 @@ The UI automatically saves profile edits after a short debounce and control rele
 - GSI config installation and Wine/Proton registry management with backups and
   running-prefix checks. Existing upstream SDK bridge DLLs are wire-compatible.
 - Per-user Unix JSON IPC, single-instance service, independent GUI lifecycle,
-  optional login startup, and KDE DPI/profile OSD.
+  optional login startup, and KDE / freedesktop DPI/profile OSD.
 
 ## Native boundaries and dependencies
 

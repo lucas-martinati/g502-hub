@@ -82,10 +82,10 @@ pub fn active(pfx: &Path) -> bool {
                         item.strip_prefix(b"STEAM_COMPAT_DATA_PATH=")
                             .map(|v| PathBuf::from(String::from_utf8_lossy(v).as_ref()).join("pfx"))
                     };
-                    if let Some(path) = target {
-                        if path.canonicalize().unwrap_or(path) == pfx {
-                            return true;
-                        }
+                    if let Some(path) = target
+                        && path.canonicalize().unwrap_or(path) == pfx
+                    {
+                        return true;
                     }
                 }
             }
@@ -139,26 +139,48 @@ pub fn prefixes() -> Vec<Value> {
                 if let Ok(id) = entry.file_name().to_string_lossy().parse::<u32>() {
                     let pfx = entry.path().join("pfx");
                     if pfx.join("system.reg").is_file() {
-                        list.push(json!({"appid":id,"name":games.get(&id).cloned().unwrap_or(format!("Jeu non-Steam {id}")),"path":pfx,"installed":installed(&pfx)}));
+                        list.push(json!({"appid":id,"name":games.get(&id).cloned().unwrap_or(format!("Non-Steam game {id}")),"path":pfx,"installed":installed(&pfx)}));
                     }
                 }
             }
         }
     }
+    list.sort_by_key(|item| item["name"].as_str().unwrap_or("").to_lowercase());
     list
 }
+fn has_bridge_dlls(dir: &Path) -> bool {
+    ["x64", "x86"]
+        .iter()
+        .all(|arch| dir.join(arch).join("LogitechLed.dll").is_file())
+}
 pub fn bin_dir() -> PathBuf {
-    std::env::var_os("G502_RUST_BRIDGE_DIR")
+    if let Some(dir) = std::env::var_os("G502_RUST_BRIDGE_DIR") {
+        return PathBuf::from(dir);
+    }
+    let primary = config::data_dir().join("bridge_bin");
+    if has_bridge_dlls(&primary) {
+        return primary;
+    }
+    let xdg_data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| config::data_dir().join("bridge_bin"))
+        .unwrap_or_else(|| config::home().join(".local/share"));
+    for candidate in [
+        xdg_data.join("g502-hub/bridge_bin"),
+        PathBuf::from("/usr/share/g502-hub/bridge_bin"),
+    ] {
+        if has_bridge_dlls(&candidate) {
+            return candidate;
+        }
+    }
+    primary
 }
 pub fn install(pfx: &Path, bin: &Path) -> Result<()> {
     ensure!(
         !active(pfx),
-        "Ferme le jeu et Wine avant de modifier son préfixe"
+        "Close the game and Wine before modifying its prefix"
     );
     let reg = pfx.join("system.reg");
-    let original = fs::read(&reg).context("Ce dossier n’est pas un préfixe Wine")?;
+    let original = fs::read(&reg).context("This folder is not a Wine prefix")?;
     let text = latin(&original);
     let entries = layout(pfx, &text);
     for (_, _, arch, _) in &entries {
@@ -210,7 +232,7 @@ pub fn install(pfx: &Path, bin: &Path) -> Result<()> {
 pub fn uninstall(pfx: &Path) -> Result<()> {
     ensure!(
         !active(pfx),
-        "Ferme le jeu et Wine avant de modifier son préfixe"
+        "Close the game and Wine before modifying its prefix"
     );
     let reg = pfx.join("system.reg");
     let text = latin(&fs::read(&reg)?);
@@ -220,10 +242,7 @@ pub fn uninstall(pfx: &Path) -> Result<()> {
         .parent()
         .unwrap()
         .join("g502hub-rust-lightsync.json");
-    ensure!(
-        marker.exists(),
-        "Ce préfixe n’a pas été modifié par la version Rust"
-    );
+    ensure!(marker.exists(), "This prefix was not modified by G502 Hub");
     let info: Value = serde_json::from_slice(&fs::read(&marker)?)?;
     let (pre, sections) = blocks(&text);
     let mut out = pre;

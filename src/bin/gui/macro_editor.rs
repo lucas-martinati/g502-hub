@@ -20,7 +20,7 @@ pub fn select(ui: &mut egui::Ui, id: &str, value: &mut Value, options: &[(&str, 
         });
     *value = json!(current);
 }
-fn number(
+pub fn number(
     ui: &mut egui::Ui,
     value: &mut Value,
     range: std::ops::RangeInclusive<i64>,
@@ -35,8 +35,9 @@ fn number(
     }
 }
 
-pub fn sequence(ui: &mut egui::Ui, draft: &mut Value) {
+pub fn sequence(ui: &mut egui::Ui, draft: &mut Value, capture_step: &mut Option<usize>) {
     let steps = draft["steps"].as_array_mut().unwrap();
+    let mut clear_all = false;
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("ADD ACTION").small().color(MUTED));
         for (label, kind, args) in [
@@ -52,7 +53,14 @@ pub fn sequence(ui: &mut egui::Ui, draft: &mut Value) {
                 steps.push(json!({"kind":kind,"args":args}));
             }
         }
+        if !steps.is_empty() && ui.button("Clear all").clicked() {
+            clear_all = true;
+        }
     });
+    if clear_all {
+        steps.clear();
+        *capture_step = None;
+    }
     ui.add_space(12.);
     ui.label(
         RichText::new(format!(
@@ -168,7 +176,36 @@ pub fn sequence(ui: &mut egui::Ui, draft: &mut Value) {
                                                 ("key-up", "Release"),
                                             ],
                                         );
-                                        string(ui, &mut step["args"]["combo"]);
+                                        let capturing = *capture_step == Some(i);
+                                        if ui
+                                            .button(if capturing {
+                                                "Press key… (Esc)"
+                                            } else {
+                                                "Capture"
+                                            })
+                                            .clicked()
+                                        {
+                                            *capture_step = if capturing { None } else { Some(i) };
+                                        }
+                                        let mut combo_str =
+                                            step["args"]["combo"].as_str().unwrap_or("").to_owned();
+                                        if ui
+                                            .add(
+                                                egui::TextEdit::singleline(&mut combo_str)
+                                                    .desired_width(160.)
+                                                    .hint_text("e.g. ctrl+c"),
+                                            )
+                                            .changed()
+                                        {
+                                            step["args"]["combo"] = json!(combo_str);
+                                        }
+                                        if let Err(err) = input::combo(&combo_str) {
+                                            ui.label(
+                                                RichText::new(err.to_string())
+                                                    .small()
+                                                    .color(Color32::from_rgb(255, 90, 95)),
+                                            );
+                                        }
                                     }
                                     "click" | "button-down" | "button-up" => {
                                         select(
@@ -240,12 +277,17 @@ pub fn sequence(ui: &mut egui::Ui, draft: &mut Value) {
         });
     if let Some(i) = remove {
         steps.remove(i);
+        *capture_step = None;
     } else if let Some(i) = duplicate {
         steps.insert(i + 1, steps[i].clone());
-    } else if let Some((from, to)) = reorder {
-        if from < len && to < len && from != to {
-            let item = steps.remove(from);
-            steps.insert(to, item);
-        }
+        *capture_step = None;
+    } else if let Some((from, to)) = reorder
+        && from < len
+        && to < len
+        && from != to
+    {
+        let item = steps.remove(from);
+        steps.insert(to, item);
+        *capture_step = None;
     }
 }

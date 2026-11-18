@@ -127,8 +127,10 @@ impl Profile {
         } else {
             Some(String::from_utf16_lossy(
                 &bytes
-                    .chunks_exact(2)
-                    .map(|p| u16::from_le_bytes([p[0], p[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&p| u16::from_le_bytes(p))
                     .take_while(|&c| c != 0)
                     .collect::<Vec<_>>(),
             ))
@@ -140,14 +142,8 @@ impl Profile {
             dpi: std::array::from_fn(|i| u16::from_le_bytes([raw[3 + i * 2], raw[4 + i * 2]])),
             color: [raw[13], raw[14], raw[15]],
             angle_snapping: raw[17],
-            buttons: raw[32..96]
-                .chunks_exact(4)
-                .map(|p| p.try_into().unwrap())
-                .collect(),
-            gshift: raw[96..160]
-                .chunks_exact(4)
-                .map(|p| p.try_into().unwrap())
-                .collect(),
+            buttons: raw[32..96].as_chunks::<4>().0.to_vec(),
+            gshift: raw[96..160].as_chunks::<4>().0.to_vec(),
             name,
             leds: vec![Led::decode(&raw[208..219])?, Led::decode(&raw[219..230])?],
             alt_leds: vec![Led::decode(&raw[230..241])?, Led::decode(&raw[241..252])?],
@@ -235,12 +231,12 @@ impl Directory {
             return Ok(None);
         }
         let mut entries = vec![];
-        for p in raw[..raw.len() - 2].chunks_exact(4) {
+        for &p in raw[..raw.len() - 2].as_chunks::<4>().0 {
             let sector = u16::from_be_bytes([p[0], p[1]]);
             if sector == 65535 {
                 return Ok(Some(Self {
                     entries,
-                    terminator: p.try_into().unwrap(),
+                    terminator: p,
                     raw: raw.to_vec(),
                 }));
             }

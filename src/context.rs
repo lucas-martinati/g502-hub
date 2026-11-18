@@ -113,15 +113,15 @@ pub fn installed_games() -> Vec<Game> {
                         .iter()
                         .find(|(k, _)| k == "name")
                         .map(|(_, v)| v.clone());
-                    if let (Some(appid), Some(name)) = (id, name) {
-                        if !is_tool(appid, &name) {
-                            games.push(Game {
-                                appid,
-                                name,
-                                pid: 0,
-                                art: find_art(appid),
-                            });
-                        }
+                    if let (Some(appid), Some(name)) = (id, name)
+                        && !is_tool(appid, &name)
+                    {
+                        games.push(Game {
+                            appid,
+                            name,
+                            pid: 0,
+                            art: find_art(appid),
+                        });
                     }
                 }
             }
@@ -223,48 +223,84 @@ fn media(bus: &Connection) -> Result<Vec<Media>> {
     });
     Ok(list)
 }
-fn x11_window() -> Result<(String, String, Option<u32>)> {
-    use x11rb::{
-        connection::Connection as _,
-        protocol::xproto::{AtomEnum, ConnectionExt},
-    };
-    let (c, screen) = x11rb::connect(None)?;
-    let root = c.setup().roots[screen].root;
-    let atom = |s: &[u8]| -> Result<u32> { Ok(c.intern_atom(false, s)?.reply()?.atom) };
-    let prop = c
-        .get_property(
-            false,
+struct X11Tracker {
+    conn: x11rb::rust_connection::RustConnection,
+    root: u32,
+    net_active_window: u32,
+    net_wm_name: u32,
+    net_wm_pid: u32,
+}
+impl X11Tracker {
+    fn connect() -> Result<Self> {
+        use x11rb::{connection::Connection as _, protocol::xproto::ConnectionExt};
+        let (conn, screen) = x11rb::connect(None)?;
+        let root = conn.setup().roots[screen].root;
+        let active_cookie = conn.intern_atom(false, b"_NET_ACTIVE_WINDOW")?;
+        let name_cookie = conn.intern_atom(false, b"_NET_WM_NAME")?;
+        let pid_cookie = conn.intern_atom(false, b"_NET_WM_PID")?;
+        Ok(Self {
+            net_active_window: active_cookie.reply()?.atom,
+            net_wm_name: name_cookie.reply()?.atom,
+            net_wm_pid: pid_cookie.reply()?.atom,
+            conn,
             root,
-            atom(b"_NET_ACTIVE_WINDOW")?,
-            AtomEnum::WINDOW,
-            0,
-            1,
-        )?
-        .reply()?;
-    let win = prop
-        .value32()
-        .and_then(|mut v| v.next())
-        .context("No active window")?;
-    let class = c
-        .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)?
-        .reply()?
-        .value;
-    let app = class
-        .split(|&b| b == 0)
-        .filter(|p| !p.is_empty())
-        .next_back()
-        .map(|p| String::from_utf8_lossy(p).to_lowercase())
-        .unwrap_or_default();
-    let title = c
-        .get_property(false, win, atom(b"_NET_WM_NAME")?, AtomEnum::ANY, 0, 4096)?
-        .reply()?
-        .value;
-    let pid = c
-        .get_property(false, win, atom(b"_NET_WM_PID")?, AtomEnum::CARDINAL, 0, 1)?
-        .reply()?
-        .value32()
-        .and_then(|mut p| p.next());
-    Ok((app, String::from_utf8_lossy(&title).into_owned(), pid))
+        })
+    }
+    fn active_window(&self) -> Result<(String, String, Option<u32>)> {
+        use x11rb::protocol::xproto::{AtomEnum, ConnectionExt};
+        let prop = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.net_active_window,
+                AtomEnum::WINDOW,
+                0,
+                1,
+            )?
+            .reply()?;
+        let Some(win) = prop
+            .value32()
+            .and_then(|mut v| v.next())
+            .filter(|&w| w != 0)
+        else {
+            return Ok((String::new(), String::new(), None));
+        };
+        let class_cookie =
+            self.conn
+                .get_property(false, win, AtomEnum::WM_CLASS, AtomEnum::STRING, 0, 1024)?;
+        let title_cookie =
+            self.conn
+                .get_property(false, win, self.net_wm_name, AtomEnum::ANY, 0, 4096)?;
+        let pid_cookie =
+            self.conn
+                .get_property(false, win, self.net_wm_pid, AtomEnum::CARDINAL, 0, 1)?;
+        let Ok(class_reply) = class_cookie.reply() else {
+            // Window closed between _NET_ACTIVE_WINDOW and property read.
+            return Ok((String::new(), String::new(), None));
+        };
+        let app = class_reply
+            .value
+            .split(|&b| b == 0)
+            .rfind(|p| !p.is_empty())
+            .map(|p| String::from_utf8_lossy(p).to_lowercase())
+            .unwrap_or_default();
+        let mut title = title_cookie.reply().map(|r| r.value).unwrap_or_default();
+        if title.is_empty()
+            && let Some(fallback) = self
+                .conn
+                .get_property(false, win, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 4096)
+                .ok()
+                .and_then(|c| c.reply().ok())
+        {
+            title = fallback.value;
+        }
+        let pid = pid_cookie
+            .reply()
+            .ok()
+            .and_then(|r| r.value32().and_then(|mut p| p.next()));
+        Ok((app, String::from_utf8_lossy(&title).into_owned(), pid))
+    }
 }
 struct ActiveWindow {
     state: Arc<Mutex<Context>>,
@@ -330,17 +366,32 @@ impl Watcher {
             } else {
                 None
             };
+            let mut x11: Option<X11Tracker> = None;
+            let mut x11_retry = Instant::now() - Duration::from_secs(10);
             let mut seen = HashMap::<u32, Option<u32>>::new();
-            let mut games = HashMap::<u32, Game>::new();
+            let mut games: HashMap<u32, Game> = installed_games()
+                .into_iter()
+                .map(|g| (g.appid, g))
+                .collect();
+            let mut games_refreshed = Instant::now();
             let mut scan = Instant::now() - Duration::from_secs(10);
             let mut scan_media = Instant::now() - Duration::from_secs(10);
             while !end.load(Ordering::Relaxed) {
                 if kwin.is_none() {
-                    if let Ok((app, title, pid)) = x11_window() {
-                        let mut s = s.lock().unwrap();
-                        s.app = app;
-                        s.title = title;
-                        s.pid = pid;
+                    if x11.is_none() && x11_retry.elapsed() >= Duration::from_secs(5) {
+                        x11_retry = Instant::now();
+                        x11 = X11Tracker::connect().ok();
+                    }
+                    if let Some(tracker) = &x11 {
+                        match tracker.active_window() {
+                            Ok((app, title, pid)) => {
+                                let mut s = s.lock().unwrap();
+                                s.app = app;
+                                s.title = title;
+                                s.pid = pid;
+                            }
+                            Err(_) => x11 = None,
+                        }
                     }
                 }
                 if scan.elapsed() >= Duration::from_secs(2) {
@@ -384,11 +435,17 @@ impl Watcher {
                         }
                     }
                     seen.retain(|p, _| pids.contains(p));
-                    if games.is_empty() {
+                    if seen
+                        .values()
+                        .flatten()
+                        .any(|id| !games.contains_key(id) && !is_tool(*id, ""))
+                        && games_refreshed.elapsed() >= Duration::from_secs(30)
+                    {
                         games = installed_games()
                             .into_iter()
                             .map(|g| (g.appid, g))
                             .collect();
+                        games_refreshed = Instant::now();
                     }
                     let focused = s.lock().unwrap().pid;
                     let mut running: Vec<_> = seen
@@ -412,10 +469,10 @@ impl Watcher {
                 }
                 if scan_media.elapsed() >= Duration::from_secs(1) {
                     scan_media = Instant::now();
-                    if let Some(b) = &bus {
-                        if let Ok(media) = media(b) {
-                            s.lock().unwrap().media = media;
-                        }
+                    if let Some(b) = &bus
+                        && let Ok(media) = media(b)
+                    {
+                        s.lock().unwrap().media = media;
                     }
                 }
                 for _ in 0..5 {
@@ -425,15 +482,12 @@ impl Watcher {
                     thread::sleep(Duration::from_millis(100));
                 }
             }
-            if let Some(bus) = bus {
-                if kwin.is_some() {
-                    if let Ok(p) =
-                        Proxy::new(&bus, "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting")
-                    {
-                        let _: zbus::Result<bool> =
-                            p.call("unloadScript", &("g502hub-rust-activewindow",));
-                    }
-                }
+            if let Some(bus) = bus
+                && kwin.is_some()
+                && let Ok(p) =
+                    Proxy::new(&bus, "org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting")
+            {
+                let _: zbus::Result<bool> = p.call("unloadScript", &("g502hub-rust-activewindow",));
             }
             if let Some(p) = kwin {
                 let _ = fs::remove_file(p);
@@ -490,19 +544,17 @@ pub fn gsi_status() -> Value {
         ] {
             if let Ok(text) =
                 fs::read_to_string(lib.join(format!("steamapps/appmanifest_{id}.acf")))
-            {
-                if let Some((_, dir)) = vdf_pairs(&text)
+                && let Some((_, dir)) = vdf_pairs(&text)
                     .into_iter()
                     .find(|(k, _)| k == "installdir")
-                {
-                    let installed = lib
-                        .join("steamapps/common")
-                        .join(dir)
-                        .join(suffix)
-                        .join("gamestate_integration_g502hub.cfg")
-                        .is_file();
-                    result.insert(game.into(), Value::Bool(installed));
-                }
+            {
+                let installed = lib
+                    .join("steamapps/common")
+                    .join(dir)
+                    .join(suffix)
+                    .join("gamestate_integration_g502hub.cfg")
+                    .is_file();
+                result.insert(game.into(), Value::Bool(installed));
             }
         }
     }

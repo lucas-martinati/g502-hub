@@ -15,7 +15,10 @@ use std::{
     fs,
     io::{BufRead, BufReader, Read, Write},
     os::{fd::AsRawFd, unix::net::UnixListener},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU32, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -40,13 +43,24 @@ pub struct Snapshot {
     pub seen_media: Vec<String>,
     pub active_rule: Option<Value>,
     pub colors: Option<[[u8; 3]; 2]>,
+    #[serde(default = "default_service_version")]
+    pub service_version: String,
+    #[serde(default)]
+    pub update: Option<crate::updater::UpdateInfo>,
     pub status: String,
     pub error: Option<String>,
     pub macro_error: Option<String>,
     pub pid: u32,
 }
+fn default_service_version() -> String {
+    env!("CARGO_PKG_VERSION").into()
+}
 fn default_dpi_range() -> [u16; 3] {
     [100, 25600, 50]
+}
+enum BgUpdate {
+    Found(Option<crate::updater::UpdateInfo>),
+    AutoInstalled(String, std::path::PathBuf),
 }
 struct Engine {
     device: Option<Device>,
@@ -65,6 +79,9 @@ struct Engine {
     blocked_rule: Option<String>,
     last_colors: Option<[[u8; 3]; 2]>,
     last_send: Instant,
+    update_rx: Option<std::sync::mpsc::Receiver<BgUpdate>>,
+    next_update_check: Instant,
+    pending_handoff: Option<(String, std::path::PathBuf)>,
 }
 impl Engine {
     fn new() -> Result<Self> {
@@ -79,6 +96,7 @@ impl Engine {
             device: None,
             snapshot: Snapshot {
                 settings,
+                service_version: default_service_version(),
                 pid: std::process::id(),
                 ..Default::default()
             },
@@ -96,6 +114,9 @@ impl Engine {
             blocked_rule: None,
             last_colors: None,
             last_send: Instant::now(),
+            update_rx: None,
+            next_update_check: Instant::now() + Duration::from_secs(20),
+            pending_handoff: None,
         };
         e.update_watcher();
         Ok(e)
@@ -150,11 +171,12 @@ impl Engine {
         self.snapshot.directory = Some(directory);
         self.snapshot.profiles = profiles;
         self.snapshot.connected = true;
-        self.snapshot.status = "Prêt — service Rust natif".into();
+        self.snapshot.status = "Ready".into();
         self.snapshot.error = None;
         self.device = Some(d);
         self.backup_done = false;
         self.mask = 0;
+        self.rule_id = None;
         self.sync_spy()?;
         Ok(())
     }
@@ -185,7 +207,7 @@ impl Engine {
         self.mask = 0;
         self.snapshot.connected = false;
         self.snapshot.error = Some(error.to_string());
-        self.snapshot.status = "Souris déconnectée — reconnexion automatique".into();
+        self.snapshot.status = "Mouse disconnected — reconnecting".into();
     }
     fn current_profile(&self) -> Option<&Profile> {
         self.snapshot
@@ -274,9 +296,10 @@ impl Engine {
             {
                 let text = if before.0 != self.snapshot.slot {
                     format!(
-                        "{} · profil {}",
+                        "{} · Profile {}",
                         self.current_profile()
                             .and_then(|p| p.name.as_deref())
+                            .filter(|s| !s.is_empty())
                             .unwrap_or("G502"),
                         self.snapshot.slot
                     )
@@ -289,9 +312,7 @@ impl Engine {
                             .unwrap_or(0)
                     )
                 };
-                std::thread::spawn(move || {
-                    let _ = show_osd(&text);
-                });
+                queue_osd(text);
             }
         }
         self.sync_spy()?;
@@ -302,6 +323,9 @@ impl Engine {
         if let Some(w) = &self.watcher {
             self.snapshot.context = w.snapshot();
         }
+        self.evaluate_rules()
+    }
+    fn evaluate_rules(&mut self) -> Result<()> {
         crate::parity::remember(&mut self.snapshot.seen_apps, &self.snapshot.context.app);
         for media in &self.snapshot.context.media {
             if media.status == "Playing" {
@@ -330,15 +354,17 @@ impl Engine {
                 if self.slot_before.is_none() {
                     self.slot_before = Some(self.snapshot.slot);
                 }
-                if self.snapshot.connected {
-                    self.activate(slot as usize)?;
-                }
-            } else if let Some(slot) = self.slot_before.take() {
-                if old.as_ref().and_then(|r| r["slot"].as_u64()) == Some(self.snapshot.slot as u64)
-                    && self.snapshot.connected
+                if self.snapshot.connected
+                    && let Err(e) = self.activate(slot as usize)
                 {
-                    self.activate(slot)?;
+                    self.snapshot.error = Some(e.to_string());
                 }
+            } else if let Some(slot) = self.slot_before.take()
+                && old.as_ref().and_then(|r| r["slot"].as_u64()) == Some(self.snapshot.slot as u64)
+                && self.snapshot.connected
+                && let Err(e) = self.activate(slot)
+            {
+                self.snapshot.error = Some(e.to_string());
             }
             self.rule_id = id;
         }
@@ -360,14 +386,14 @@ impl Engine {
         );
         if let Some(c) = colors {
             self.snapshot.colors = Some(c);
-            if self.last_colors != Some(c) || self.last_send.elapsed() > Duration::from_secs(1) {
-                if let Some(d) = &mut self.device {
-                    for (z, rgb) in c.iter().enumerate() {
-                        d.led(z, &Led::fixed(*rgb))?;
-                    }
-                    self.last_colors = Some(c);
-                    self.last_send = Instant::now();
+            if (self.last_colors != Some(c) || self.last_send.elapsed() > Duration::from_secs(1))
+                && let Some(d) = &mut self.device
+            {
+                for (z, rgb) in c.iter().enumerate() {
+                    d.led(z, &Led::fixed(*rgb))?;
                 }
+                self.last_colors = Some(c);
+                self.last_send = Instant::now();
             }
         } else if self.live.kind.is_empty() {
             self.snapshot.colors = None;
@@ -376,11 +402,11 @@ impl Engine {
                 self.last_colors = None;
             }
         }
-        if let Some(token) = self.live.restore_token.take() {
-            if self.snapshot.settings["screen_token"].as_str() != Some(&token) {
-                self.snapshot.settings["screen_token"] = token.into();
-                config::save(&self.snapshot.settings)?;
-            }
+        if let Some(token) = self.live.restore_token.take()
+            && self.snapshot.settings["screen_token"].as_str() != Some(&token)
+        {
+            self.snapshot.settings["screen_token"] = token.into();
+            config::save(&self.snapshot.settings)?;
         }
         if let Some(error) = self.live.error.clone() {
             self.snapshot.error = Some(error);
@@ -409,7 +435,7 @@ impl Engine {
         Ok(())
     }
     fn d(&mut self) -> Result<&mut Device> {
-        self.device.as_mut().context("G502 HERO non connectée")
+        self.device.as_mut().context("G502 HERO not connected")
     }
     fn sector(&self, slot: usize) -> Result<u16> {
         self.snapshot
@@ -417,7 +443,7 @@ impl Engine {
             .as_ref()
             .and_then(|d| slot.checked_sub(1).and_then(|i| d.entries.get(i)))
             .map(|e| e.sector)
-            .context("Profil invalide")
+            .context("Invalid profile")
     }
     fn activate(&mut self, slot: usize) -> Result<()> {
         let sector = self.sector(slot)?;
@@ -436,10 +462,11 @@ impl Engine {
     }
     fn backup(&mut self, path: Option<&str>) -> Result<String> {
         let data = self.d()?.backup()?;
+        let auto_dir = config::data_dir().join("backups");
         let p = if let Some(path) = path {
             std::path::PathBuf::from(path)
         } else {
-            config::data_dir().join("backups").join(format!(
+            auto_dir.join(format!(
                 "onboard-{}.json",
                 SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis()
             ))
@@ -448,6 +475,9 @@ impl Engine {
             fs::create_dir_all(parent)?;
         }
         fs::write(&p, serde_json::to_vec_pretty(&data)?)?;
+        if path.is_none() {
+            prune_auto_backups(&auto_dir, 50);
+        }
         self.backup_done = true;
         Ok(p.display().to_string())
     }
@@ -486,7 +516,7 @@ impl Engine {
         }
         self.snapshot.profiles[slot - 1] = profile;
         self.last_colors = None;
-        self.snapshot.status = "Profil enregistré et vérifié sur la souris".into();
+        self.snapshot.status = "Profile saved and verified on mouse".into();
         Ok(())
     }
     fn clear_app_assignments(&mut self, slot: usize) -> Result<()> {
@@ -541,7 +571,7 @@ impl Engine {
         self.snapshot.settings = value;
         self.update_watcher();
         self.sync_spy()?;
-        self.snapshot.status = "Réglages enregistrés".into();
+        self.snapshot.status = "Settings saved".into();
         Ok(())
     }
     fn macro_sector(&mut self, id: &str) -> Result<u16> {
@@ -657,11 +687,11 @@ impl Engine {
             }
             "settings" => {
                 self.settings(a)?;
-                Ok(json!("Réglages enregistrés"))
+                Ok(json!("Settings saved"))
             }
             "activate" => {
                 self.activate(a["slot"].as_u64().context("Missing slot")? as usize)?;
-                Ok(json!("Profil activé"))
+                Ok(json!("Profile activated"))
             }
             "write_profile" => {
                 let slot = a["slot"].as_u64().context("Missing slot")? as usize;
@@ -673,13 +703,13 @@ impl Engine {
                     );
                 }
                 self.write_profile(slot, p)?;
-                if slot == self.snapshot.slot {
-                    if let Some(index) = a["dpi_index"].as_u64() {
-                        self.d()?.dpi_index(index as u8)?;
-                        self.snapshot.dpi_index = index as usize;
-                    }
+                if slot == self.snapshot.slot
+                    && let Some(index) = a["dpi_index"].as_u64()
+                {
+                    self.d()?.dpi_index(index as u8)?;
+                    self.snapshot.dpi_index = index as usize;
                 }
-                Ok(json!("Profil enregistré"))
+                Ok(json!("Profile saved"))
             }
             "preview_dpi" => {
                 let dpi = u16::try_from(a["dpi"].as_u64().context("Missing DPI")?)?;
@@ -729,7 +759,7 @@ impl Engine {
                 }
                 self.write_profile(slot, p)?;
                 self.clear_app_assignments(slot)?;
-                Ok(json!("Profil importé ; macros externes désactivées"))
+                Ok(json!("Profile imported; external macros disabled"))
             }
             "restore" => {
                 let value: Value = serde_json::from_slice(&fs::read(
@@ -767,7 +797,7 @@ impl Engine {
                     self.d()?.activate(u16::try_from(n)?)?;
                 }
                 self.connect()?;
-                Ok(json!("Sauvegarde restaurée et vérifiée"))
+                Ok(json!("Backup restored and verified"))
             }
             "copy_profile" => {
                 let from = a["from"].as_u64().context("Missing source")? as usize;
@@ -777,7 +807,7 @@ impl Engine {
                 let p = self.snapshot.profiles[from - 1].clone();
                 self.write_profile(to, p)?;
                 self.clear_app_assignments(to)?;
-                Ok(json!("Profil copié"))
+                Ok(json!("Profile copied"))
             }
             "reset_profile" => {
                 let slot = a["slot"].as_u64().context("Missing slot")? as usize;
@@ -788,7 +818,7 @@ impl Engine {
                 let p = self.d()?.profile(sector)?;
                 self.write_profile(slot, p)?;
                 self.clear_app_assignments(slot)?;
-                Ok(json!("Profil usine restauré"))
+                Ok(json!("Factory profile restored"))
             }
             "profile_enabled" => {
                 let slot = a["slot"].as_u64().context("Missing slot")? as usize;
@@ -805,17 +835,23 @@ impl Engine {
                 }
                 self.snapshot.directory = Some(dir);
                 self.poll()?;
-                Ok(json!("Cycle des profils enregistré"))
+                Ok(json!("Profile cycle saved"))
             }
             "assign_macro" => {
                 self.assign_macro(&a)?;
-                Ok(json!("Macro assignée et vérifiée"))
+                Ok(json!("Macro assigned"))
             }
             "save_macro" => {
                 let id = a["id"].as_str().context("Macro id missing")?.to_owned();
                 crate::parity::macro_size(&a, &self.typing)?;
                 let old_page = self.snapshot.settings["macro_pages"][&id].as_u64();
                 let to_mouse = a["target"] == "mouse";
+                if !to_mouse && let Some(old_page) = old_page {
+                    ensure!(
+                        macro_page_allowed(&self.snapshot, old_page),
+                        "Protected profile sector cannot be erased as a macro"
+                    );
+                }
                 let app_used = self.snapshot.settings["app_macros"]
                     .as_object()
                     .is_some_and(|m| m.values().any(|v| v == &id));
@@ -865,6 +901,9 @@ impl Engine {
                     for key in added {
                         settings["app_macros"][key] = id.clone().into();
                     }
+                    if let Some(map) = settings["macro_pages"].as_object_mut() {
+                        map.remove(&id);
+                    }
                 }
                 if !settings["macros"].is_array() {
                     settings["macros"] = json!([]);
@@ -876,7 +915,15 @@ impl Engine {
                     list.push(a);
                 }
                 self.settings(settings)?;
-                Ok(json!("Macro enregistrée"))
+                if !to_mouse
+                    && let Some(old_page) = old_page
+                    && self.device.is_some()
+                {
+                    let size = self.d()?.info.sector_size;
+                    self.d()?
+                        .write_sector(u16::try_from(old_page)?, &vec![255; size], true)?;
+                }
+                Ok(json!("Macro saved"))
             }
             "delete_macro" => {
                 let id = a["id"].as_str().context("Missing macro id")?;
@@ -911,12 +958,14 @@ impl Engine {
                     map.remove(id);
                 }
                 self.settings(settings)?;
-                if let Some(page) = page {
+                if let Some(page) = page
+                    && self.device.is_some()
+                {
                     let size = self.d()?.info.sector_size;
                     self.d()?
                         .write_sector(u16::try_from(page)?, &vec![255; size], true)?;
                 }
-                Ok(json!("Macro supprimée"))
+                Ok(json!("Macro deleted"))
             }
             "bridge_prefixes" => Ok(json!(crate::bridge::prefixes())),
             "bridge_install" => {
@@ -924,13 +973,13 @@ impl Engine {
                     std::path::Path::new(a["path"].as_str().context("Missing prefix")?),
                     &crate::bridge::bin_dir(),
                 )?;
-                Ok(json!("Intégration LIGHTSYNC installée"))
+                Ok(json!("LIGHTSYNC integration installed"))
             }
             "bridge_remove" => {
                 crate::bridge::uninstall(std::path::Path::new(
                     a["path"].as_str().context("Missing prefix")?,
                 ))?;
-                Ok(json!("Intégration LIGHTSYNC retirée"))
+                Ok(json!("LIGHTSYNC integration removed"))
             }
             "gsi_status" => Ok(context::gsi_status()),
             "games" => Ok(serde_json::to_value(context::installed_games())?),
@@ -967,29 +1016,165 @@ impl Engine {
                 self.settings(s)?;
                 Ok(Value::Null)
             }
+            "check_update" => {
+                let info = crate::updater::check_for_updates()?;
+                self.snapshot.update = info.clone();
+                self.next_update_check = Instant::now() + Duration::from_secs(6 * 3600);
+                Ok(serde_json::to_value(info)?)
+            }
             other => bail!("Unknown command {other}"),
+        }
+    }
+    fn tick_updater(&mut self) {
+        if let Some(rx) = &self.update_rx {
+            match rx.try_recv() {
+                Ok(BgUpdate::Found(info)) => {
+                    self.snapshot.update = info;
+                    self.update_rx = None;
+                }
+                Ok(BgUpdate::AutoInstalled(version, gui_bin)) => {
+                    self.snapshot.update = None;
+                    self.pending_handoff = Some((version, gui_bin));
+                    self.update_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.update_rx = None;
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some((version, _)) = &self.pending_handoff
+            && self.mask == 0
+        {
+            if self.snapshot.settings["osd"].as_bool().unwrap_or(true) {
+                queue_osd(format!("G502 Hub updated to v{version}"));
+            }
+            STOP.store(true, Ordering::Relaxed);
+            return;
+        }
+        if self.update_rx.is_none()
+            && self.pending_handoff.is_none()
+            && Instant::now() >= self.next_update_check
+            && std::env::var_os("G502_RUST_HIDRAW_ROOT").is_none()
+        {
+            self.next_update_check = Instant::now() + Duration::from_secs(6 * 3600);
+            let auto = self.snapshot.settings["auto_update"]
+                .as_bool()
+                .unwrap_or(true)
+                && crate::updater::can_auto_update_current_exe();
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.update_rx = Some(rx);
+            std::thread::spawn(move || {
+                if let Ok(found) = crate::updater::check_for_updates() {
+                    if let Some(info) = &found
+                        && auto
+                        && let Ok(gui_bin) =
+                            crate::updater::download_and_install_update(info, |_, _, _| {})
+                    {
+                        let _ = tx.send(BgUpdate::AutoInstalled(
+                            info.latest_version.clone(),
+                            gui_bin,
+                        ));
+                        return;
+                    }
+                    let _ = tx.send(BgUpdate::Found(found));
+                }
+            });
         }
     }
     fn stop(&mut self) {
         self.player.stop_all();
         let _ = self.restore_lighting();
-        if let Some(d) = &mut self.device {
-            if self.spy.is_some() {
-                let _ = d.spy_stop();
-            }
+        if let Some(d) = &mut self.device
+            && self.spy.is_some()
+        {
+            let _ = d.spy_stop();
         }
     }
 }
+static OSD_PENDING: Mutex<Option<String>> = Mutex::new(None);
+static OSD_RUNNING: AtomicBool = AtomicBool::new(false);
+static OSD_NOTIFICATION_ID: AtomicU32 = AtomicU32::new(0);
+fn queue_osd(text: String) {
+    *OSD_PENDING.lock().unwrap() = Some(text);
+    if OSD_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        std::thread::spawn(|| {
+            while let Some(msg) = OSD_PENDING.lock().unwrap().take() {
+                let _ = show_osd(&msg);
+            }
+            OSD_RUNNING.store(false, Ordering::SeqCst);
+        });
+    }
+}
 fn show_osd(text: &str) -> Result<()> {
-    let c = zbus::blocking::Connection::session()?;
-    let p = zbus::blocking::Proxy::new(
+    let c = zbus::blocking::connection::Builder::session()?
+        .method_timeout(Duration::from_secs(2))
+        .build()?;
+    if let Ok(p) = zbus::blocking::Proxy::new(
         &c,
         "org.kde.plasmashell",
         "/org/kde/osdService",
         "org.kde.osdService",
+    ) && p
+        .call::<_, _, ()>("showText", &("input-mouse", text))
+        .is_ok()
+    {
+        return Ok(());
+    }
+    let p = zbus::blocking::Proxy::new(
+        &c,
+        "org.freedesktop.Notifications",
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications",
     )?;
-    let _: () = p.call("showText", &("input-mouse", text))?;
+    let hints = HashMap::from([
+        ("transient", zbus::zvariant::Value::from(true)),
+        (
+            "x-canonical-private-synchronous",
+            zbus::zvariant::Value::from("g502-hub"),
+        ),
+    ]);
+    let prev = OSD_NOTIFICATION_ID.load(Ordering::Relaxed);
+    let id: u32 = p.call(
+        "Notify",
+        &(
+            "G502 Hub",
+            prev,
+            "input-mouse",
+            text,
+            "",
+            Vec::<&str>::new(),
+            hints,
+            1500i32,
+        ),
+    )?;
+    OSD_NOTIFICATION_ID.store(id, Ordering::Relaxed);
     Ok(())
+}
+pub fn prune_auto_backups(dir: &std::path::Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut auto: Vec<_> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("onboard-") && n.ends_with(".json"))
+        })
+        .collect();
+    if auto.len() <= keep {
+        return;
+    }
+    auto.sort();
+    let remove_count = auto.len() - keep;
+    for old in auto.into_iter().take(remove_count) {
+        let _ = fs::remove_file(old);
+    }
 }
 #[derive(Default)]
 struct SleepClock {
@@ -1051,7 +1236,7 @@ pub fn run() -> Result<()> {
         // Reopen both physical and virtual devices after wake, even when the
         // hidraw descriptor survived and no I/O error signalled the USB reset.
         if sleep_clock.resumed() {
-            e.lost(anyhow::anyhow!("Reconnexion après la mise en veille"));
+            e.lost(anyhow::anyhow!("Reconnecting after sleep"));
             e.player = Player::default();
             if let Err(error) = e.connect() {
                 e.lost(error);
@@ -1104,10 +1289,10 @@ pub fn run() -> Result<()> {
         unsafe {
             libc::poll(fds.as_mut_ptr(), 2, timeout);
         }
-        if fds[1].revents != 0 {
-            if let Err(error) = e.events() {
-                e.lost(error);
-            }
+        if fds[1].revents != 0
+            && let Err(error) = e.events()
+        {
+            e.lost(error);
         }
         if fds[0].revents & libc::POLLIN != 0 {
             while let Ok((mut stream, _)) = listener.accept() {
@@ -1149,6 +1334,7 @@ pub fn run() -> Result<()> {
             if let Err(error) = e.events() {
                 e.lost(error);
             }
+            e.tick_updater();
         }
         if last_rule.elapsed() >= Duration::from_millis(300) {
             last_rule = Instant::now();
@@ -1163,8 +1349,37 @@ pub fn run() -> Result<()> {
             }
         }
     }
+    let handoff = e.pending_handoff.take();
     e.stop();
     let _ = fs::remove_file(socket);
+    drop(_lock);
+    if let Some((_, gui_bin)) = handoff {
+        let daemon_bin = gui_bin.with_file_name("g502-hubd");
+        if daemon_bin.is_file() {
+            use std::os::unix::process::CommandExt;
+            let mut cmd = std::process::Command::new(daemon_bin);
+            cmd.stdin(std::process::Stdio::null());
+            if let Ok(rt) = config::runtime()
+                && let Ok(log) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(rt.join("service.log"))
+                && let Ok(err) = log.try_clone()
+            {
+                cmd.stdout(log).stderr(err);
+            } else {
+                cmd.stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+            }
+            unsafe {
+                cmd.pre_exec(|| {
+                    let _ = libc::setsid();
+                    Ok(())
+                });
+            }
+            let _ = cmd.spawn();
+        }
+    }
     Ok(())
 }
 
@@ -1184,27 +1399,29 @@ mod memory_guard_tests {
     use super::*;
     #[test]
     fn macros_cannot_overwrite_profiles_or_factory_memory() {
-        let mut snapshot = Snapshot::default();
-        snapshot.info = Some(Info {
-            profile_format: 2,
-            macro_format: 1,
-            profile_count: 5,
-            rom_profile_count: 5,
-            button_count: 11,
-            sector_count: 10,
-            sector_size: 255,
-        });
-        snapshot.directory = Some(Directory {
-            entries: (1..=5)
-                .map(|sector| crate::model::Entry {
-                    sector,
-                    enabled: true,
-                    flag: 0,
-                })
-                .collect(),
-            terminator: [255, 255, 0, 0],
-            raw: vec![],
-        });
+        let snapshot = Snapshot {
+            info: Some(Info {
+                profile_format: 2,
+                macro_format: 1,
+                profile_count: 5,
+                rom_profile_count: 5,
+                button_count: 11,
+                sector_count: 10,
+                sector_size: 255,
+            }),
+            directory: Some(Directory {
+                entries: (1..=5)
+                    .map(|sector| crate::model::Entry {
+                        sector,
+                        enabled: true,
+                        flag: 0,
+                    })
+                    .collect(),
+                terminator: [255, 255, 0, 0],
+                raw: vec![],
+            }),
+            ..Default::default()
+        };
         for page in [0, 1, 2, 3, 4, 5, 10, 256] {
             assert!(!macro_page_allowed(&snapshot, page));
         }
@@ -1227,5 +1444,251 @@ mod resume_tests {
         assert!(!clock.observe(d(3731), d(91)));
         assert!(clock.observe(d(3742), d(92))); // another suspend
         assert!(!clock.observe(d(3743), d(93)));
+    }
+    #[test]
+    fn auto_backup_pruning_keeps_newest_and_preserves_custom_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "g502-prune-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        for n in 1000..1008 {
+            fs::write(dir.join(format!("onboard-{n}.json")), b"{}").unwrap();
+        }
+        fs::write(dir.join("custom-backup.json"), b"{}").unwrap();
+        prune_auto_backups(&dir, 5);
+        let mut names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "custom-backup.json",
+                "onboard-1003.json",
+                "onboard-1004.json",
+                "onboard-1005.json",
+                "onboard-1006.json",
+                "onboard-1007.json",
+            ]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn switching_macro_from_mouse_to_app_reclaims_onboard_sector_and_disabled_rule_slot_keeps_lighting()
+     {
+        use std::io::{Read, Write};
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        use std::os::unix::net::UnixStream;
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/onboard-c08b.json")).unwrap();
+        let raw_dir = model::unhex(fixture["sectors"]["0x0000"].as_str().unwrap()).unwrap();
+        let raw_p1 = model::unhex(fixture["sectors"]["0x0001"].as_str().unwrap()).unwrap();
+        let mut sectors: HashMap<u16, Vec<u8>> = HashMap::new();
+        sectors.insert(0, raw_dir.clone());
+        for s in 1..=5u16 {
+            let key = format!("0x{s:04X}");
+            sectors.insert(
+                s,
+                model::unhex(fixture["sectors"][&key].as_str().unwrap()).unwrap(),
+            );
+        }
+        for s in 6..10u16 {
+            sectors.insert(s, vec![255; 255]);
+        }
+        let shared_sectors = std::sync::Arc::new(Mutex::new(sectors));
+        let server_sectors = shared_sectors.clone();
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut active_sector = 1u16;
+            let mut active_dpi = 0u8;
+            let mut write_target = 0u16;
+            let mut pending = Vec::new();
+            loop {
+                let mut id = [0u8];
+                if b.read_exact(&mut id).is_err() {
+                    break;
+                }
+                let size = if id[0] == 0x10 { 7 } else { 20 };
+                let mut pkt = vec![0u8; size];
+                pkt[0] = id[0];
+                if b.read_exact(&mut pkt[1..]).is_err() {
+                    break;
+                }
+                let feat = pkt[2];
+                let fn_id = pkt[3] >> 4;
+                let mut payload = vec![0u8; 16];
+                match (feat, fn_id) {
+                    (1, 3) => active_sector = u16::from_be_bytes([pkt[4], pkt[5]]),
+                    (1, 4) => payload[..2].copy_from_slice(&active_sector.to_be_bytes()),
+                    (1, 11) => payload[0] = active_dpi,
+                    (1, 12) => active_dpi = pkt[4],
+                    (1, 5) => {
+                        let sec = u16::from_be_bytes([pkt[4], pkt[5]]);
+                        let off = u16::from_be_bytes([pkt[6], pkt[7]]) as usize;
+                        let map = server_sectors.lock().unwrap();
+                        let data = &map[&sec];
+                        payload.copy_from_slice(&data[off..off + 16]);
+                    }
+                    (1, 6) => {
+                        write_target = u16::from_be_bytes([pkt[4], pkt[5]]);
+                        pending.clear();
+                    }
+                    (1, 7) => pending.extend_from_slice(&pkt[4..]),
+                    (1, 8) => {
+                        pending.truncate(255);
+                        server_sectors
+                            .lock()
+                            .unwrap()
+                            .insert(write_target, pending.clone());
+                    }
+                    (2, _) => {}
+                    _ => {}
+                }
+                let mut reply = vec![0x11, 255, pkt[2], pkt[3]];
+                reply.extend_from_slice(&payload);
+                let _ = b.write_all(&reply);
+            }
+        });
+        let mut hid = crate::device::Hid::from_file(
+            unsafe { std::fs::File::from_raw_fd(a.into_raw_fd()) },
+            std::path::PathBuf::from("mock"),
+        );
+        hid.index_for_test(0x8100, 1);
+        hid.index_for_test(0x8110, 2);
+        let lock_path = std::env::temp_dir().join(format!("g502-svc-lock-{}", std::process::id()));
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&lock_path)
+            .unwrap();
+        let _ = fs::remove_file(&lock_path);
+        let info = Info {
+            profile_format: 2,
+            macro_format: 1,
+            profile_count: 5,
+            rom_profile_count: 5,
+            button_count: 11,
+            sector_count: 10,
+            sector_size: 255,
+        };
+        let mut dir = Directory::decode(&raw_dir).unwrap().unwrap();
+        dir.entries[2].enabled = false;
+        let profiles: Vec<_> = (1..=5).map(|_| Profile::decode(&raw_p1).unwrap()).collect();
+        let cfg_root = std::env::temp_dir().join(format!(
+            "g502-svc-cfg-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", &cfg_root);
+            std::env::set_var("XDG_DATA_HOME", &cfg_root);
+        }
+        let mut engine = Engine {
+            device: Some(Device::for_test(hid, info.clone(), lock)),
+            snapshot: Snapshot {
+                connected: true,
+                info: Some(info),
+                directory: Some(dir),
+                profiles,
+                slot: 1,
+                settings: json!({"macros":[],"app_macros":{},"macro_pages":{},"rules":[]}),
+                ..Default::default()
+            },
+            watcher: None,
+            context_until: None,
+            live: Live::default(),
+            player: Player::default(),
+            typing: input::typing_table("us").unwrap(),
+            spy: None,
+            last_spy_start: Instant::now(),
+            mask: 0,
+            backup_done: true,
+            slot_before: None,
+            rule_id: None,
+            blocked_rule: None,
+            last_colors: None,
+            last_send: Instant::now(),
+            update_rx: None,
+            next_update_check: Instant::now() + Duration::from_secs(3600),
+            pending_handoff: None,
+        };
+        let m_mouse = json!({
+            "id": "m_switch",
+            "name": "Click",
+            "mode": "once",
+            "target": "mouse",
+            "gap_ms": 0,
+            "steps": [{"kind": "click", "args": {"button": "left"}}]
+        });
+        engine.command("save_macro", m_mouse).unwrap();
+        engine
+            .command(
+                "assign_macro",
+                json!({"id": "m_switch", "slot": 1, "layer": 0, "button": 5}),
+            )
+            .unwrap();
+        assert_eq!(engine.snapshot.settings["macro_pages"]["m_switch"], 6);
+        assert!(shared_sectors.lock().unwrap()[&6].iter().any(|&x| x != 255));
+
+        // Switch the macro from mouse storage to app execution: sector 6 must be reclaimed!
+        let m_app = json!({
+            "id": "m_switch",
+            "name": "Click",
+            "mode": "while-held",
+            "target": "app",
+            "gap_ms": 0,
+            "steps": [{"kind": "click", "args": {"button": "left"}}]
+        });
+        engine.command("save_macro", m_app).unwrap();
+        assert!(engine.snapshot.settings["macro_pages"]["m_switch"].is_null());
+        assert_eq!(engine.snapshot.settings["app_macros"]["1:0:5"], "m_switch");
+        assert!(shared_sectors.lock().unwrap()[&6].iter().all(|&x| x == 255));
+
+        // Rule targeting disabled slot 3 should record an error without aborting active_rule lighting.
+        engine.snapshot.settings["rules"] = json!([{
+            "id": "r1",
+            "name": "Disabled slot rule",
+            "trigger": "app",
+            "value": "firefox",
+            "lighting": "color",
+            "color": "#ff0000",
+            "slot": 3,
+            "enabled": true
+        }]);
+        engine.snapshot.context.app = "firefox".into();
+        engine.evaluate_rules().unwrap();
+        assert_eq!(
+            engine.snapshot.active_rule.as_ref().unwrap()["id"],
+            json!("r1")
+        );
+        assert_eq!(engine.rule_id.as_deref(), Some("r1"));
+        assert!(engine.snapshot.error.is_some());
+
+        // Rule targeting enabled slot 2 switches slot and restores slot 1 when context changes.
+        engine.snapshot.settings["rules"][0]["slot"] = json!(2);
+        engine.rule_id = None;
+        engine.slot_before = None;
+        engine.evaluate_rules().unwrap();
+        assert_eq!(engine.snapshot.slot, 2);
+        engine.snapshot.context.app = "terminal".into();
+        engine.evaluate_rules().unwrap();
+        assert_eq!(engine.snapshot.slot, 1);
+        assert!(engine.snapshot.active_rule.is_none());
+
+        drop(engine);
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(cfg_root);
     }
 }

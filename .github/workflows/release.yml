@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release (e.g. 0.3.1 or v0.3.1). Leave empty to use Cargo.toml version.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install system libraries
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libx11-dev libxi-dev libgl1-mesa-dev libwayland-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Synchronize version in Cargo.toml
+        id: version_step
+        run: |
+          RAW_VERSION="${{ github.event.inputs.version }}"
+          if [ -z "$RAW_VERSION" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+              RAW_VERSION="${GITHUB_REF_NAME}"
+            else
+              RAW_VERSION=$(grep '^version = ' Cargo.toml | head -n1 | cut -d '"' -f2)
+            fi
+          fi
+          CLEAN_VERSION="${RAW_VERSION#v}"
+          TAG_VERSION="v${CLEAN_VERSION}"
+          sed -i -E "s/^version = \".*\"/version = \"${CLEAN_VERSION}\"/" Cargo.toml
+          cargo check
+          echo "clean_version=${CLEAN_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag_version=${TAG_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Commit updated version if manual dispatch
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.version != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cargo check
+          git add Cargo.toml Cargo.lock
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(release): bump version to ${{ steps.version_step.outputs.clean_version }}"
+            git tag -f "${{ steps.version_step.outputs.tag_version }}"
+            git push origin HEAD --tags
+          fi
+
+      - name: Run Format & Clippy
+        run: |
+          cargo fmt --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo check --locked --no-default-features --bin g502-hubd
+
+      - name: Run Tests
+        run: cargo test --locked --release
+
+      - name: Build release binaries
+        run: cargo build --locked --release
+
+      - name: Package release archives & SHA-256 checksums
+        id: package
+        run: |
+          VERSION="${{ steps.version_step.outputs.tag_version }}"
+          ARCH="linux-x86_64"
+          PKG_DIR="g502-hub-${VERSION}-${ARCH}"
+          STABLE_ARCHIVE="g502-hub-${ARCH}.tar.gz"
+
+          mkdir -p "${PKG_DIR}/udev"
+          cp target/release/g502-hub "${PKG_DIR}/"
+          cp target/release/g502-hubd "${PKG_DIR}/"
+          cp install.sh "${PKG_DIR}/"
+          chmod +x "${PKG_DIR}/install.sh" "${PKG_DIR}/g502-hub" "${PKG_DIR}/g502-hubd"
+          cp udev/70-g502-hub.rules "${PKG_DIR}/udev/"
+          cp LICENSE NOTICE.md README.md "${PKG_DIR}/"
+
+          tar -czvf "${PKG_DIR}.tar.gz" "${PKG_DIR}"
+          sha256sum "${PKG_DIR}.tar.gz" > "${PKG_DIR}.tar.gz.sha256"
+
+          cp "${PKG_DIR}.tar.gz" "${STABLE_ARCHIVE}"
+          sha256sum "${STABLE_ARCHIVE}" > "${STABLE_ARCHIVE}.sha256"
+
+          echo "versioned_archive=${PKG_DIR}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "versioned_sha=${PKG_DIR}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+          echo "stable_archive=${STABLE_ARCHIVE}" >> "$GITHUB_OUTPUT"
+          echo "stable_sha=${STABLE_ARCHIVE}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "G502 Hub ${{ steps.version_step.outputs.tag_version }}"
+          tag_name: ${{ steps.version_step.outputs.tag_version }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: |
+            ${{ steps.package.outputs.versioned_archive }}
+            ${{ steps.package.outputs.versioned_sha }}
+            ${{ steps.package.outputs.stable_archive }}
+            ${{ steps.package.outputs.stable_sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

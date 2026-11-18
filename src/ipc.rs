@@ -50,10 +50,15 @@ pub fn ensure_service() -> Result<()> {
         .parent()
         .context("No executable directory")?
         .to_owned();
+    let runtime = config::runtime()?;
+    let log_path = runtime.join("service.log");
+    if log_path.metadata().is_ok_and(|m| m.len() > 1024 * 1024) {
+        let _ = std::fs::rename(&log_path, runtime.join("service.log.old"));
+    }
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(config::runtime()?.join("service.log"))?;
+        .open(log_path)?;
     use std::os::unix::process::CommandExt;
     let mut command = Command::new(dir.join("g502-hubd"));
     command

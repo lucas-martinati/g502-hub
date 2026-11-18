@@ -10,3 +10,4 @@ pub mod ipc;
 pub mod model;
 pub mod parity;
 pub mod service;
+pub mod updater;

@@ -215,14 +215,49 @@ pub struct Capture {
     portal: Arc<Mutex<PortalState>>,
     thread: Option<thread::JoinHandle<()>>,
 }
+fn temp_error_log() -> Option<std::fs::File> {
+    let path = std::env::temp_dir().join(format!(
+        "g502-capture-{}-{}.err",
+        std::process::id(),
+        TOKEN.fetch_add(1, Ordering::Relaxed)
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
+    let _ = std::fs::remove_file(path);
+    Some(file)
+}
+fn read_error_tail(file: Option<&mut std::fs::File>, fallback: &str) -> String {
+    use std::io::Seek;
+    if let Some(f) = file
+        && f.rewind().is_ok()
+    {
+        let mut buf = String::new();
+        let _ = f.take(1024).read_to_string(&mut buf);
+        if let Some(line) = buf.lines().map(str::trim).rfind(|l| !l.is_empty()) {
+            return line.to_owned();
+        }
+    }
+    fallback.into()
+}
 fn spawn_capture(
     command: &mut Command,
     child: &Arc<Mutex<Option<Child>>>,
+    stderr_file: Option<&std::fs::File>,
+    hint: &str,
 ) -> Result<std::process::ChildStdout> {
+    let err = stderr_file
+        .and_then(|f| f.try_clone().ok())
+        .map(Stdio::from)
+        .unwrap_or_else(Stdio::null);
     let mut c = command
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
+        .stderr(err)
+        .spawn()
+        .with_context(|| hint.to_owned())?;
     let stdout = c.stdout.take().context("No capture pipe")?;
     *child.lock().unwrap() = Some(c);
     Ok(stdout)
@@ -301,7 +336,7 @@ fn pipewire(
         .context("Portal session missing")?;
     let session = OwnedObjectPath::try_from(value.try_clone()?).or_else(|_| {
         let s = <&str>::try_from(value)?;
-        OwnedObjectPath::try_from(s).map_err(zbus::zvariant::Error::from)
+        OwnedObjectPath::try_from(s)
     })?;
     state.lock().unwrap().session = Some(session.to_string());
     let proxy = Proxy::new(
@@ -358,6 +393,7 @@ impl Capture {
         let (d, ch, s, p) = (data.clone(), child.clone(), stop.clone(), portal.clone());
         let audio = kind == "audio";
         let thread = thread::spawn(move || {
+            let mut stderr_log = temp_error_log();
             let result = (|| -> Result<()> {
                 if audio {
                     let mut cmd = Command::new("parec");
@@ -368,14 +404,32 @@ impl Capture {
                         "--channels=1",
                         "--latency-msec=30",
                     ]);
-                    let mut pipe = spawn_capture(&mut cmd, &ch)?;
+                    let mut pipe = spawn_capture(
+                        &mut cmd,
+                        &ch,
+                        stderr_log.as_ref(),
+                        "Install pulseaudio-utils or pipewire-pulse (parec) for audio effects",
+                    )?;
                     let mut analyzer = crate::audio::Analyzer::default();
                     let mut bytes = [0u8; 1024];
                     while !s.load(Ordering::Relaxed) {
-                        pipe.read_exact(&mut bytes)?;
+                        if let Err(e) = pipe.read_exact(&mut bytes) {
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                bail!(
+                                    "{}",
+                                    read_error_tail(
+                                        stderr_log.as_mut(),
+                                        "Audio monitor stream ended unexpectedly",
+                                    )
+                                );
+                            }
+                            return Err(e.into());
+                        }
                         let samples: Vec<_> = bytes
-                            .chunks_exact(2)
-                            .map(|p| i16::from_le_bytes([p[0], p[1]]))
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|&p| i16::from_le_bytes(p))
                             .collect();
                         if let Some(levels) = analyzer.feed(&samples) {
                             let mut shared = d.lock().unwrap();
@@ -427,19 +481,35 @@ impl Capture {
                         "fdsink",
                         "fd=1",
                     ]);
-                    let mut pipe = spawn_capture(&mut cmd, &ch)?;
+                    let mut pipe = spawn_capture(
+                        &mut cmd,
+                        &ch,
+                        stderr_log.as_ref(),
+                        "Install gstreamer1.0-tools and plugins (gst-launch-1.0) for screen sampling",
+                    )?;
                     let mut frame = vec![0; 64 * 36 * 3];
                     while !s.load(Ordering::Relaxed) {
-                        pipe.read_exact(&mut frame)?;
+                        if let Err(e) = pipe.read_exact(&mut frame) {
+                            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                                bail!(
+                                    "{}",
+                                    read_error_tail(
+                                        stderr_log.as_mut(),
+                                        "Screen capture stream ended unexpectedly",
+                                    )
+                                );
+                            }
+                            return Err(e.into());
+                        }
                         d.lock().unwrap().frame.clone_from(&frame);
                     }
                 }
                 Ok(())
             })();
-            if let Err(e) = result {
-                if !s.load(Ordering::Relaxed) {
-                    d.lock().unwrap().error = Some(e.to_string());
-                }
+            if let Err(e) = result
+                && !s.load(Ordering::Relaxed)
+            {
+                d.lock().unwrap().error = Some(e.to_string());
             }
         });
         Self {
@@ -464,20 +534,19 @@ impl Drop for Capture {
                 (portal.request.as_ref(), "org.freedesktop.portal.Request"),
                 (portal.session.as_ref(), "org.freedesktop.portal.Session"),
             ] {
-                if let Some(path) = path {
-                    if let Ok(p) =
+                if let Some(path) = path
+                    && let Ok(p) =
                         Proxy::new(bus, "org.freedesktop.portal.Desktop", path.as_str(), iface)
-                    {
-                        let _: zbus::Result<()> = p.call("Close", &());
-                    }
+                {
+                    let _: zbus::Result<()> = p.call("Close", &());
                 }
             }
         }
         drop(portal);
-        if let Some(t) = self.thread.take() {
-            if t.is_finished() {
-                let _ = t.join();
-            }
+        if let Some(t) = self.thread.take()
+            && t.is_finished()
+        {
+            let _ = t.join();
         }
     }
 }
@@ -503,15 +572,15 @@ impl Default for Channel {
 impl Channel {
     fn colors(&self, t: f32) -> Colors {
         std::array::from_fn(|z| {
-            if let Some((kind, rgb, start, duration, period)) = self.effect {
-                if duration <= 0. || t - start < duration {
-                    let phase = (t - start) / period.max(0.02);
-                    return if kind == 5 {
-                        if phase as i32 % 2 == 0 { rgb } else { [0.; 3] }
-                    } else {
-                        scale(rgb, pulse(phase, 1.))
-                    };
-                }
+            if let Some((kind, rgb, start, duration, period)) = self.effect
+                && (duration <= 0. || t - start < duration)
+            {
+                let phase = (t - start) / period.max(0.02);
+                return if kind == 5 {
+                    if phase as i32 % 2 == 0 { rgb } else { [0.; 3] }
+                } else {
+                    scale(rgb, pulse(phase, 1.))
+                };
             }
             self.zones[z].unwrap_or(self.base)
         })
@@ -544,8 +613,10 @@ impl Sdk {
         }
         let pid = u32::from_le_bytes(b[4..8].try_into().unwrap());
         let a: Vec<i32> = b[8..8 + count * 4]
-            .chunks_exact(4)
-            .map(|p| i32::from_le_bytes(p.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&p| i32::from_le_bytes(p))
             .collect();
         if op == 1 || self.pid == 0 || (self.closed && op != 2) {
             *self = Self {
@@ -622,6 +693,8 @@ pub struct GameInputs {
     sdk: Arc<Mutex<Sdk>>,
     stop: Arc<AtomicBool>,
     start: Instant,
+    tcp_thread: Option<thread::JoinHandle<()>>,
+    udp_thread: Option<thread::JoinHandle<()>>,
 }
 impl GameInputs {
     fn new() -> Result<Self> {
@@ -634,7 +707,7 @@ impl GameInputs {
         let sdk = Arc::new(Mutex::new(Sdk::default()));
         let start = Instant::now();
         let (s, g) = (stop.clone(), gsi.clone());
-        thread::spawn(move || {
+        let tcp_thread = thread::spawn(move || {
             while !s.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut c, _)) => {
@@ -706,15 +779,15 @@ impl GameInputs {
             }
         });
         let (s, sk) = (stop.clone(), sdk.clone());
-        thread::spawn(move || {
+        let udp_thread = thread::spawn(move || {
             let mut b = [0; 512];
             while !s.load(Ordering::Relaxed) {
-                if let Ok((n, addr)) = udp.recv_from(&mut b) {
-                    if addr.ip().is_loopback() {
-                        sk.lock()
-                            .unwrap()
-                            .handle(&b[..n], start.elapsed().as_secs_f32());
-                    }
+                if let Ok((n, addr)) = udp.recv_from(&mut b)
+                    && addr.ip().is_loopback()
+                {
+                    sk.lock()
+                        .unwrap()
+                        .handle(&b[..n], start.elapsed().as_secs_f32());
                 }
             }
         });
@@ -723,19 +796,21 @@ impl GameInputs {
             sdk,
             stop,
             start,
+            tcp_thread: Some(tcp_thread),
+            udp_thread: Some(udp_thread),
         })
     }
     fn colors(&self, t: f32, state: &mut GameStates) -> Option<Colors> {
-        if let Some((at, game, data)) = &*self.gsi.lock().unwrap() {
-            if at.elapsed() < Duration::from_secs(10) {
-                let fx = if game == "cs2" {
-                    &mut state.cs2
-                } else {
-                    &mut state.dota2
-                };
-                if let Some(c) = fx.colors(game, data, t) {
-                    return Some(c);
-                }
+        if let Some((at, game, data)) = &*self.gsi.lock().unwrap()
+            && at.elapsed() < Duration::from_secs(10)
+        {
+            let fx = if game == "cs2" {
+                &mut state.cs2
+            } else {
+                &mut state.dota2
+            };
+            if let Some(c) = fx.colors(game, data, t) {
+                return Some(c);
             }
         }
         self.sdk
@@ -747,6 +822,12 @@ impl GameInputs {
 impl Drop for GameInputs {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.tcp_thread.take() {
+            let _ = t.join();
+        }
+        if let Some(t) = self.udp_thread.take() {
+            let _ = t.join();
+        }
     }
 }
 #[derive(Default)]
@@ -929,10 +1010,10 @@ impl GameFx {
         Some(out)
     }
     fn kill(&mut self, n: Option<u64>, t: f32) {
-        if let (Some(old), Some(n)) = (self.kills, n) {
-            if n > old {
-                self.kill_at = Some(t);
-            }
+        if let (Some(old), Some(n)) = (self.kills, n)
+            && n > old
+        {
+            self.kill_at = Some(t);
         }
         self.kills = n;
         if self.kill_at.is_some_and(|at| t - at > 2.) {
@@ -1213,9 +1294,9 @@ impl Live {
         } else {
             1.
         };
-        for z in 0..2 {
+        for (z, item) in target.iter_mut().enumerate() {
             if self.have_current {
-                target[z] = mix(self.current[z], target[z], response);
+                *item = mix(self.current[z], *item, response);
             }
         }
         self.current = target;
@@ -1231,8 +1312,8 @@ mod tests {
     #[test]
     fn vivid_screen_sampling_emphasizes_colored_highlights() {
         let mut frame = vec![64; 64 * 36 * 3];
-        for pixel in frame.chunks_exact_mut(3).take(64 * 9) {
-            pixel.copy_from_slice(&[255, 0, 0]);
+        for pixel in frame.as_chunks_mut::<3>().0.iter_mut().take(64 * 9) {
+            *pixel = [255, 0, 0];
         }
         let average = sample(&frame, "screen", false);
         let vivid = sample(&frame, "screen", true);

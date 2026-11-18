@@ -95,4 +95,28 @@ fn native_service_lifecycle_and_rejected_commands() {
         .unwrap();
     assert!(!second.status.success());
     assert_eq!(service.rpc("ping", json!({}))["result"]["pid"], pid);
+
+    let saved = service.rpc(
+        "save_macro",
+        json!({
+            "id": "m1",
+            "name": "Quick Click",
+            "mode": "once",
+            "target": "app",
+            "gap_ms": 15,
+            "steps": [{"kind": "click", "args": {"button": "left"}}]
+        }),
+    );
+    assert!(saved["error"].is_null());
+    let snap = service.rpc("snapshot", json!({}));
+    assert_eq!(snap["result"]["settings"]["macros"][0]["gap_ms"], 15);
+    assert!(service.rpc("delete_macro", json!({"id": "m1"}))["error"].is_null());
+
+    let help = Command::new(bin).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("Usage:"));
+
+    let version = Command::new(bin).arg("--version").output().unwrap();
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).contains("g502-hubd"));
 }

@@ -185,6 +185,10 @@ impl Hid {
         }
         Ok(())
     }
+    #[cfg(test)]
+    pub(crate) fn index_for_test(&mut self, feature: u16, idx: u8) {
+        self.features.insert(feature, idx);
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Info {
@@ -267,12 +271,30 @@ impl Device {
                 effects,
             });
         }
-        let dir = std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(format!("/tmp/g502-hub-{}", unsafe { libc::getuid() }))
-            });
-        fs::create_dir_all(&dir)?;
+        let uid = unsafe { libc::getuid() };
+        let dir = if let Some(runtime) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let p = PathBuf::from(runtime);
+            if !p.exists() {
+                fs::create_dir_all(&p)?;
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
+            }
+            p
+        } else {
+            let p = PathBuf::from(format!("/tmp/g502-hub-{uid}"));
+            if !p.exists() {
+                fs::create_dir_all(&p)?;
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
+            }
+            use std::os::unix::fs::MetadataExt;
+            let meta = fs::symlink_metadata(&p)?;
+            ensure!(
+                meta.is_dir() && meta.uid() == uid && meta.mode() & 0o077 == 0,
+                "Unsafe hardware lock directory"
+            );
+            p
+        };
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -468,6 +490,17 @@ impl Device {
     pub fn spy_stop(&mut self) -> Result<()> {
         self.hid.call(0x8110, 2, &[])?;
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(hid: Hid, info: Info, lock: File) -> Self {
+        Self {
+            hid,
+            info,
+            zones: vec![],
+            name: "G502 HERO".into(),
+            firmware: vec![],
+            lock,
+        }
     }
     pub fn backup(&mut self) -> Result<serde_json::Value> {
         let mut sectors = serde_json::Map::new();

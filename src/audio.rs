@@ -67,20 +67,20 @@ impl Analyzer {
             let floor = 10f64.powf(-50. / 20.);
             let peak_decay = 0.5f64.powf(1. / (5. * 44100. / 512.));
             let release = (-1f64 / (0.12 * 44100. / 512.)).exp();
-            for b in 0..4 {
-                values[b] = values[b].sqrt();
+            for (b, value) in values.iter_mut().enumerate() {
+                *value = value.sqrt();
                 let relative = if b == 0 {
                     0.
                 } else {
                     self.peaks[0] * 10f64.powf(-24. / 20.)
                 };
-                self.peaks[b] = values[b]
+                self.peaks[b] = (*value)
                     .max(self.peaks[b] * peak_decay)
                     .max(floor)
                     .max(relative);
-                let db = 20. * values[b].max(1e-12).log10();
+                let db = 20. * (*value).max(1e-12).log10();
                 let gate = ((db + 50.) / 6.).clamp(0., 1.);
-                let target = (values[b] / self.peaks[b]).min(1.) * gate;
+                let target = (*value / self.peaks[b]).min(1.) * gate;
                 self.out[b] = target.max(self.out[b] * release);
             }
             if values[0] > floor && csum > 0. {
